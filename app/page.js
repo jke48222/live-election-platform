@@ -25,11 +25,16 @@ function setVotedRoles(arr) {
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 const VOTER_NAME_STORAGE_KEY = "nsbe_voter_display_name";
 
-function PinScreen({ onJoin }) {
+function PinScreen({ onJoin, sessionNotice = "" }) {
   const [displayName, setDisplayName] = useState("");
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
   const [joining, setJoining] = useState(false);
+  const [notice, setNotice] = useState(sessionNotice);
+
+  useEffect(() => {
+    setNotice(sessionNotice || "");
+  }, [sessionNotice]);
 
   useEffect(() => {
     try {
@@ -98,6 +103,7 @@ function PinScreen({ onJoin }) {
           onChange={(e) => {
             setDisplayName(e.target.value);
             setError("");
+            setNotice("");
           }}
           onKeyDown={(e) => e.key === "Enter" && handleJoin()}
           className="w-full h-12 px-4 rounded-xl border-2 border-gray-200 bg-white text-uga-black font-medium
@@ -122,6 +128,7 @@ function PinScreen({ onJoin }) {
           onChange={(e) => {
             setPin(e.target.value.replace(/\D/g, "").slice(0, 4));
             setError("");
+            setNotice("");
           }}
           onKeyDown={(e) => e.key === "Enter" && handleJoin()}
           className="w-full h-14 text-center text-3xl tracking-[0.4em] font-bold
@@ -130,6 +137,15 @@ function PinScreen({ onJoin }) {
                      transition-all placeholder:text-gray-300"
           aria-describedby={error ? "join-error" : undefined}
         />
+
+        {notice && (
+          <p
+            role="status"
+            className="text-amber-900 text-sm mt-2 font-medium bg-amber-50 border border-amber-200/80 rounded-lg px-3 py-2"
+          >
+            {notice}
+          </p>
+        )}
 
         {error && (
           <p id="join-error" role="alert" className="text-uga-red text-sm mt-2 font-medium">
@@ -246,6 +262,7 @@ function BallotCard({ candidate, isSelected, onSelect }) {
 export default function VoterPage() {
   const [joined, setJoined] = useState(false);
   const [deviceHash, setDeviceHash] = useState(null);
+  const [sessionNotice, setSessionNotice] = useState("");
 
   // Election state
   const [electionState, setElectionState] = useState(null); // { status, active_role_id, poll_expires_at }
@@ -262,6 +279,8 @@ export default function VoterPage() {
 
   const supabase = useRef(null);
   const channelRef = useRef(null);
+  /** Same device as state; used in broadcast handler so closure is never stale. */
+  const deviceHashRef = useRef(null);
 
   /* ── Auto-detect timer expiry (triggers re-render to locked view) ── */
   useEffect(() => {
@@ -373,6 +392,39 @@ export default function VoterPage() {
     [handleStateChange]
   );
 
+  const handleCheckinRevoked = useCallback((payload) => {
+    const msg = payload.payload || payload;
+    const revoked = msg?.device_hash;
+    if (!revoked || revoked !== deviceHashRef.current) return;
+
+    channelRef.current?.unsubscribe();
+    channelRef.current = null;
+    supabase.current = null;
+    deviceHashRef.current = null;
+
+    setJoined(false);
+    setDeviceHash(null);
+    setElectionState(null);
+    setActiveRole(null);
+    setCandidates([]);
+    setSelectedCandidate(null);
+    setHasVotedThisRole(false);
+    setTimerExpired(false);
+    setVotingFullyComplete(false);
+    setSubmitting(false);
+
+    try {
+      localStorage.removeItem(VOTER_NAME_STORAGE_KEY);
+      localStorage.removeItem("nsbe_voted_roles");
+    } catch {
+      /* ignore */
+    }
+
+    setSessionNotice(
+      "You were removed from the room by an admin. Re-enter your name and PIN if you should still be here."
+    );
+  }, []);
+
   /* ── Join room: check-in name + device, then realtime ── */
   async function handleJoin(displayName) {
     supabase.current = getSupabaseBrowser();
@@ -393,6 +445,7 @@ export default function VoterPage() {
     }
 
     setDeviceHash(hash);
+    deviceHashRef.current = hash;
 
     // Subscribe to broadcast channel (PRD §4.2)
     const channel = supabase.current.channel("election_room", {
@@ -402,6 +455,7 @@ export default function VoterPage() {
     channel
       .on("broadcast", { event: "state_change" }, handleBroadcast)
       .on("broadcast", { event: "purge" }, handleBroadcast)
+      .on("broadcast", { event: "checkin_revoked" }, handleCheckinRevoked)
       .subscribe((status) => {
         // PRD §5.2: heartbeat callback — reconnect on disconnect
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -414,6 +468,7 @@ export default function VoterPage() {
 
     // Fetch initial state via REST
     await fetchCurrentState();
+    setSessionNotice("");
     setJoined(true);
   }
 
@@ -491,7 +546,7 @@ export default function VoterPage() {
      RENDER
      ═══════════════════════════════════════════════ */
 
-  if (!joined) return <PinScreen onJoin={handleJoin} />;
+  if (!joined) return <PinScreen onJoin={handleJoin} sessionNotice={sessionNotice} />;
 
   const status = electionState?.status || "waiting";
 
