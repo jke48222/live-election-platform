@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Merriweather:wght@700;900&family=Source+Sans+3:wght@400;500;600;700&display=swap");
+
+:root {
+  --uga-red: #BA0C2F;
+  --uga-black: #000000;
+  --uga-white: #FFFFFF;
+  --uga-gray: #F3F4F6;
+}
+
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: "Source Sans 3", "Source Sans Pro", system-ui, sans-serif;
+  background-color: var(--uga-gray);
+  color: var(--uga-black);
+  min-height: 100dvh;
+}
+
+/* Prevent pull-to-refresh on mobile during voting */
+body.voting-active {
+  overscroll-behavior: none;
+}
+
+/* Accessible focus ring */
+:focus-visible {
+  outline: 3px solid var(--uga-red);
+  outline-offset: 2px;
+}
+
+/* Bar chart animation */
+.bar-fill {
+  animation: bar-grow 0.6s ease-out forwards;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--uga-gray) 25%,
+    #e5e7eb 50%,
+    var(--uga-gray) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
