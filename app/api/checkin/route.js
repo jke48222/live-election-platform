@@ -64,16 +64,28 @@ export async function POST(req) {
     );
   }
 
+  const existingForDevice = (existingRows || []).find((row) => row.device_hash === device_hash);
+  const priorKey = existingForDevice
+    ? canonicalDuesKey(existingForDevice.display_name)
+    : null;
+  /* Admin "Confirm dues" sets dues_verified_manual. If the voter changes their checked-in name
+     on the same device, we must clear it — otherwise non-roster names still show dues_ok. */
+  const nameIdentityChanged = priorKey !== null && priorKey !== nameKey;
+
   const now = new Date().toISOString();
 
-  const { error } = await supabase.from("voter_checkins").upsert(
-    {
-      device_hash,
-      display_name: name,
-      updated_at: now,
-    },
-    { onConflict: "device_hash" }
-  );
+  const upsertRow = {
+    device_hash,
+    display_name: name,
+    updated_at: now,
+  };
+  if (nameIdentityChanged) {
+    upsertRow.dues_verified_manual = false;
+  }
+
+  const { error } = await supabase.from("voter_checkins").upsert(upsertRow, {
+    onConflict: "device_hash",
+  });
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
@@ -184,10 +196,22 @@ export async function DELETE(req) {
   }
 
   const supabase = getAdmin();
-  const { error } = await supabase.from("voter_checkins").delete().eq("device_hash", deviceHash);
+  const { data: deletedRows, error } = await supabase
+    .from("voter_checkins")
+    .delete()
+    .eq("device_hash", deviceHash)
+    .select("device_hash");
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  if (deletedRows?.length) {
+    await supabase.channel("election_room").send({
+      type: "broadcast",
+      event: "checkin_revoked",
+      payload: { device_hash: deviceHash },
+    });
   }
 
   return NextResponse.json({ ok: true });
