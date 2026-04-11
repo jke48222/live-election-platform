@@ -92,7 +92,7 @@ function PinScreen({ onJoin, sessionNotice = "" }) {
 
         {/* Name (dues / roster verification) */}
         <label htmlFor="voter-name" className="block text-sm font-semibold text-uga-black mb-2">
-          Your name
+          Your full name
         </label>
         <input
           id="voter-name"
