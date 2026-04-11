@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { ELECTION_SLATE } from "../../../lib/seed-data.mjs";
+import { isAdminRequest } from "../../../lib/admin-session";
 
 function getAdmin() {
   return createClient(
@@ -11,12 +12,29 @@ function getAdmin() {
 }
 
 export async function POST(req) {
-  const body = await req.json();
-  if (body.password !== process.env.ADMIN_PASSWORD) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const supabase = getAdmin();
+
+  // F18: refuse to nuke data while a poll is live or locked
+  const { data: currentState } = await supabase
+    .from("election_state")
+    .select("status, active_role_id")
+    .maybeSingle();
+  if (currentState && (currentState.status !== "waiting" || currentState.active_role_id)) {
+    return NextResponse.json(
+      { error: "Finish the current poll before re-seeding the database." },
+      { status: 409 }
+    );
+  }
 
   // Clear existing data
   await supabase.from("voter_checkins").delete().neq("id", "00000000-0000-0000-0000-000000000000");

@@ -262,6 +262,8 @@ function BallotCard({ candidate, isSelected, onSelect }) {
 export default function VoterPage() {
   const [joined, setJoined] = useState(false);
   const [deviceHash, setDeviceHash] = useState(null);
+  /** Roster match or admin "Confirm dues" — required before casting a vote. */
+  const [duesOk, setDuesOk] = useState(false);
   const [sessionNotice, setSessionNotice] = useState("");
 
   // Election state
@@ -272,6 +274,7 @@ export default function VoterPage() {
   // Voting
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const [hasVotedThisRole, setHasVotedThisRole] = useState(false);
   const [timerExpired, setTimerExpired] = useState(false);
   /** True when host is idle and every role is marked complete in DB. */
@@ -281,6 +284,10 @@ export default function VoterPage() {
   const channelRef = useRef(null);
   /** Same device as state; used in broadcast handler so closure is never stale. */
   const deviceHashRef = useRef(null);
+  /** F4: monotonic counter to drop out-of-order handleStateChange fetches. */
+  const stateSeqRef = useRef(0);
+  /** F10: prevents re-subscribe pile-up on rapid disconnects. */
+  const resubscribingRef = useRef(false);
 
   /* ── Auto-detect timer expiry (triggers re-render to locked view) ── */
   useEffect(() => {
@@ -333,9 +340,19 @@ export default function VoterPage() {
   /* ── Handle state changes (from broadcast or REST) ── */
   const handleStateChange = useCallback(
     async (state) => {
-      setElectionState(state);
+      // F4: only the latest call may write to state; older fetches are dropped.
+      const seq = ++stateSeqRef.current;
+
+      // F3: detect whether the active race actually changed so we don't wipe
+      // the voter's selection on incidental state updates for the same role.
+      let roleChanged = true;
+      setElectionState((prev) => {
+        roleChanged = prev?.active_role_id !== state.active_role_id;
+        return state;
+      });
 
       if (!state.active_role_id) {
+        if (seq !== stateSeqRef.current) return;
         setActiveRole(null);
         setCandidates([]);
         setSelectedCandidate(null);
@@ -349,6 +366,7 @@ export default function VoterPage() {
         .select("*")
         .eq("id", state.active_role_id)
         .single();
+      if (seq !== stateSeqRef.current) return;
       setActiveRole(role);
 
       // Fetch active candidates for this role
@@ -357,12 +375,13 @@ export default function VoterPage() {
         .select("*")
         .eq("role_id", state.active_role_id)
         .eq("is_active", true);
+      if (seq !== stateSeqRef.current) return;
       setCandidates(sortCandidatesByLastName(cands || []));
 
       // Check if already voted for this role
       const voted = getVotedRoles();
       setHasVotedThisRole(voted.includes(state.active_role_id));
-      setSelectedCandidate(null);
+      if (roleChanged) setSelectedCandidate(null);
     },
     []
   );
@@ -392,18 +411,53 @@ export default function VoterPage() {
     [handleStateChange]
   );
 
+  const refreshDuesEligibility = useCallback(async () => {
+    const h = deviceHashRef.current;
+    if (!h) return;
+    try {
+      const res = await fetch("/api/checkin/eligibility", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_hash: h }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.checked_in === true && typeof data.dues_ok === "boolean") {
+        setDuesOk(data.dues_ok);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const handleDuesVerified = useCallback((payload) => {
+    const msg = payload.payload || payload;
+    if (msg?.device_hash && msg.device_hash === deviceHashRef.current) {
+      setDuesOk(true);
+    }
+  }, []);
+
   const handleCheckinRevoked = useCallback((payload) => {
     const msg = payload.payload || payload;
     const revoked = msg?.device_hash;
     if (!revoked || revoked !== deviceHashRef.current) return;
 
-    channelRef.current?.unsubscribe();
+    // F11: keep the supabase singleton around so a re-join can reuse it.
+    // Only tear down the subscribed channel and device identity.
+    try {
+      if (channelRef.current && supabase.current?.removeChannel) {
+        supabase.current.removeChannel(channelRef.current);
+      } else {
+        channelRef.current?.unsubscribe();
+      }
+    } catch {
+      /* ignore */
+    }
     channelRef.current = null;
-    supabase.current = null;
     deviceHashRef.current = null;
 
     setJoined(false);
     setDeviceHash(null);
+    setDuesOk(false);
     setElectionState(null);
     setActiveRole(null);
     setCandidates([]);
@@ -420,9 +474,7 @@ export default function VoterPage() {
       /* ignore */
     }
 
-    setSessionNotice(
-      "You were removed from the room by an admin. Re-enter your name and PIN if you should still be here."
-    );
+    setSessionNotice("You were removed from the room by an admin.");
   }, []);
 
   /* ── Join room: check-in name + device, then realtime ── */
@@ -444,6 +496,8 @@ export default function VoterPage() {
       throw new Error(checkinJson.error || "Check-in failed. Try again.");
     }
 
+    setDuesOk(Boolean(checkinJson.dues_ok));
+
     setDeviceHash(hash);
     deviceHashRef.current = hash;
 
@@ -456,11 +510,24 @@ export default function VoterPage() {
       .on("broadcast", { event: "state_change" }, handleBroadcast)
       .on("broadcast", { event: "purge" }, handleBroadcast)
       .on("broadcast", { event: "checkin_revoked" }, handleCheckinRevoked)
+      .on("broadcast", { event: "dues_verified" }, handleDuesVerified)
       .subscribe((status) => {
-        // PRD §5.2: heartbeat callback — reconnect on disconnect
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        if (status === "SUBSCRIBED") {
+          resubscribingRef.current = false;
+          refreshDuesEligibility();
+          // F4 companion: fetch current state on (re)subscribe so we don't
+          // miss events that fired while disconnected.
+          fetchCurrentState();
+        }
+        // PRD §5.2: heartbeat callback — reconnect on disconnect.
+        // F10: guard against repeated subscribe() piling up retries.
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          if (resubscribingRef.current) return;
+          resubscribingRef.current = true;
           console.warn("Channel disconnected, reconnecting…");
-          channel.subscribe();
+          setTimeout(() => {
+            if (channelRef.current === channel) channel.subscribe();
+          }, 500);
         }
       });
 
@@ -479,12 +546,13 @@ export default function VoterPage() {
     function onVisibilityChange() {
       if (document.visibilityState === "visible") {
         fetchCurrentState();
+        refreshDuesEligibility();
       }
     }
 
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [joined, fetchCurrentState]);
+  }, [joined, fetchCurrentState, refreshDuesEligibility]);
 
   /* ── Toggle overscroll prevention during active voting ── */
   useEffect(() => {
@@ -496,40 +564,49 @@ export default function VoterPage() {
     return () => document.body.classList.remove("voting-active");
   }, [electionState?.status, hasVotedThisRole]);
 
-  /* ── Vote submission with jitter (PRD §4.1) ── */
+  /* ── Vote submission with jitter (PRD §4.1) — server enforces dues + poll rules ── */
   async function submitVote() {
     if (!selectedCandidate || !electionState?.active_role_id || !deviceHash) return;
     setSubmitting(true);
+    setSubmitError("");
 
     // Random jitter 0-400ms to prevent stampeding herd
     const jitter = Math.random() * 400;
     await new Promise((r) => setTimeout(r, jitter));
 
     try {
-      const { error } = await supabase.current.from("votes").insert({
-        role_id: electionState.active_role_id,
-        candidate_id: selectedCandidate,
-        device_hash: deviceHash,
+      const res = await fetch("/api/vote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role_id: electionState.active_role_id,
+          candidate_id: selectedCandidate,
+          device_hash: deviceHash,
+        }),
       });
+      const data = await res.json().catch(() => ({}));
 
-      if (error) {
-        // PRD §3.3: Silently catch constraint violation (duplicate vote)
-        if (error.code === "23505") {
-          console.log("Duplicate vote caught at DB level");
+      if (!res.ok) {
+        if (data.code === "dues_required") {
+          setDuesOk(false);
+          setSubmitError(data.error || "Dues verification required.");
+        } else if (res.status === 429) {
+          setSubmitError("Too many attempts. Slow down and try again.");
         } else {
-          console.error("Vote error:", error.message);
+          setSubmitError(data.error || "Could not submit your vote. Try again.");
         }
+        return;
       }
 
-      // Mark as voted in LocalStorage
+      // Mark as voted in LocalStorage (incl. duplicate idempotent success)
       const voted = getVotedRoles();
       if (!voted.includes(electionState.active_role_id)) {
         voted.push(electionState.active_role_id);
         setVotedRoles(voted);
       }
       setHasVotedThisRole(true);
-    } catch (err) {
-      console.error("Network error:", err);
+    } catch {
+      setSubmitError("Network error. Check your connection and try again.");
     } finally {
       setSubmitting(false);
     }
@@ -538,7 +615,16 @@ export default function VoterPage() {
   /* ── Cleanup ── */
   useEffect(() => {
     return () => {
-      channelRef.current?.unsubscribe();
+      try {
+        if (channelRef.current && supabase.current?.removeChannel) {
+          supabase.current.removeChannel(channelRef.current);
+        } else {
+          channelRef.current?.unsubscribe();
+        }
+      } catch {
+        /* ignore */
+      }
+      channelRef.current = null;
     };
   }, []);
 
@@ -664,6 +750,55 @@ export default function VoterPage() {
     );
   }
 
+  /* ── ACTIVE POLL but dues not cleared (roster + admin confirm) ── */
+  if (status === "voting" && !timerExpired && !duesOk) {
+    return (
+      <div className="min-h-dvh flex flex-col items-center justify-center px-6 bg-uga-gray">
+        <div className="text-center max-w-md animate-fade-in">
+          <img
+            src={NSBE_LOGO_SRC}
+            alt={NSBE_LOGO_ALT}
+            className="h-14 w-auto mx-auto mb-5 object-contain opacity-90"
+            width={105}
+            height={110}
+          />
+          <div className="w-14 h-14 mx-auto mb-5 rounded-2xl bg-amber-50 flex items-center justify-center border border-amber-200/80">
+            <svg
+              width="26"
+              height="26"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#b45309"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 8v4M12 16h.01" />
+            </svg>
+          </div>
+          <h2 className="font-display font-black text-xl text-uga-black">
+            Membership verification pending
+          </h2>
+          <p className="text-uga-gray-mid mt-3 text-sm leading-relaxed">
+            Your name is not on the automated dues list. You can vote after a host confirms your dues
+            in the admin dashboard. Keep this page open — you will be able to vote as soon as they
+            confirm.
+          </p>
+          {electionState?.poll_expires_at && (
+            <div className="mt-8">
+              <p className="text-xs font-semibold text-uga-gray-mid uppercase tracking-wide mb-2">
+                Time remaining
+              </p>
+              <CountdownTimer expiresAt={electionState.poll_expires_at} />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   /* ── ACTIVE VOTING ── */
   return (
     <div className="min-h-dvh bg-uga-gray pb-32">
@@ -712,7 +847,7 @@ export default function VoterPage() {
               <BallotCard
                 candidate={c}
                 isSelected={selectedCandidate === c.id}
-                onSelect={() => setSelectedCandidate(c.id)}
+                onSelect={() => { setSelectedCandidate(c.id); setSubmitError(""); }}
               />
             </div>
           ))}
@@ -722,6 +857,14 @@ export default function VoterPage() {
       {/* Fixed submit button */}
       <div className="fixed bottom-0 inset-x-0 p-4 bg-gradient-to-t from-uga-gray via-uga-gray to-transparent">
         <div className="max-w-lg mx-auto">
+          {submitError && (
+            <p
+              role="alert"
+              className="mb-2 text-sm font-medium text-uga-red bg-white border border-uga-red/30 rounded-lg px-3 py-2 shadow-sm"
+            >
+              {submitError}
+            </p>
+          )}
           <button
             onClick={submitVote}
             disabled={!selectedCandidate || submitting}
