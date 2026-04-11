@@ -92,12 +92,10 @@ CREATE POLICY "anon can read candidates"
 CREATE POLICY "service can do anything on candidates"
   ON public.candidates FOR ALL TO service_role USING (true);
 
--- votes: voters can INSERT only; cannot read, update, or delete
-CREATE POLICY "anon can insert votes"
-  ON public.votes FOR INSERT TO anon WITH CHECK (true);
+-- votes: inserts only via POST /api/vote (service role). Anon cannot insert (enforces dues + poll rules).
 CREATE POLICY "service can do anything on votes"
   ON public.votes FOR ALL TO service_role USING (true);
--- explicitly deny SELECT/UPDATE/DELETE to anon (default deny with RLS enabled)
+-- explicitly deny all to anon (default deny with RLS enabled)
 
 
 -- ============================================================

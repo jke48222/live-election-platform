@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { isAdminRequest } from "../../../lib/admin-session";
 
 function getAdmin() {
   return createClient(
@@ -9,27 +10,31 @@ function getAdmin() {
   );
 }
 
-function checkAuth(req, body) {
-  const pw = body?.password || req.headers.get("x-admin-password");
-  return pw === process.env.ADMIN_PASSWORD;
-}
-
 /* POST — Add floor nomination / write-in candidate */
 export async function POST(req) {
-  const body = await req.json();
-  if (!checkAuth(req, body)) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { role_id, name } = body;
-  if (!role_id || !name) {
+  const roleId = typeof body?.role_id === "string" ? body.role_id.trim() : "";
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!roleId || !name) {
     return NextResponse.json({ error: "role_id and name required" }, { status: 400 });
+  }
+  if (name.length > 255) {
+    return NextResponse.json({ error: "Name too long (max 255)" }, { status: 400 });
   }
 
   const supabase = getAdmin();
   const { data, error } = await supabase
     .from("candidates")
-    .insert({ role_id, name, is_active: true })
+    .insert({ role_id: roleId, name, is_active: true })
     .select()
     .single();
 
@@ -39,8 +44,13 @@ export async function POST(req) {
 
 /* PATCH — Toggle is_active (dual-office exclusion) */
 export async function PATCH(req) {
-  const body = await req.json();
-  if (!checkAuth(req, body)) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -63,8 +73,13 @@ export async function PATCH(req) {
 
 /* DELETE — Remove candidate from ballot (and any votes cast for them) */
 export async function DELETE(req) {
-  const body = await req.json();
-  if (!checkAuth(req, body)) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

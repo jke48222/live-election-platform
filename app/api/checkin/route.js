@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { canonicalDuesKey, isDuesPayingMember } from "../../../lib/dues-roster";
+import {
+  canonicalDuesKey,
+  isCheckinEligibleToVote,
+  isDuesPayingMember,
+} from "../../../lib/dues-roster";
+import { isAdminRequest } from "../../../lib/admin-session";
+import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
 
 function getAdmin() {
   return createClient(
@@ -14,7 +20,22 @@ const MAX_NAME = 255;
 
 /** POST — Register voter identity after PIN (same PIN as room). */
 export async function POST(req) {
-  const body = await req.json();
+  // F14: throttle check-in attempts per IP — protects PIN and roster lookup
+  const ip = clientIpFromReq(req);
+  const limited = rateLimit(`checkin:${ip}`, 20, 60_000);
+  if (!limited.ok) {
+    return NextResponse.json(
+      { error: "Too many check-in attempts. Try again shortly." },
+      { status: 429, headers: { "Retry-After": String(limited.retryAfter) } }
+    );
+  }
+
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
   const { display_name, device_hash, pin } = body;
 
   if (!pin || pin !== process.env.NEXT_PUBLIC_ROOM_PIN) {
@@ -29,7 +50,7 @@ export async function POST(req) {
     );
   }
 
-  if (!device_hash || typeof device_hash !== "string" || device_hash.length > 64) {
+  if (typeof device_hash !== "string" || !/^[0-9a-f]{64}$/.test(device_hash)) {
     return NextResponse.json({ error: "Invalid device identifier" }, { status: 400 });
   }
 
@@ -45,7 +66,7 @@ export async function POST(req) {
 
   const { data: existingRows, error: existingErr } = await supabase
     .from("voter_checkins")
-    .select("device_hash, display_name");
+    .select("device_hash, display_name, dues_verified_manual");
 
   if (existingErr) {
     return NextResponse.json({ error: existingErr.message }, { status: 500 });
@@ -92,17 +113,20 @@ export async function POST(req) {
   }
 
   const rosterMatch = isDuesPayingMember(name);
+  const manualCarriesOver =
+    !nameIdentityChanged && Boolean(existingForDevice?.dues_verified_manual);
+  const duesOk = isCheckinEligibleToVote(name, manualCarriesOver);
+
   return NextResponse.json({
     ok: true,
     roster_auto_match: rosterMatch,
-    dues_ok: rosterMatch,
+    dues_ok: duesOk,
   });
 }
 
 /** GET — Admin: list check-ins (name + timestamps only; not vote choices). */
 export async function GET(req) {
-  const pw = req.headers.get("x-admin-password");
-  if (pw !== process.env.ADMIN_PASSWORD) {
+  if (!isAdminRequest(req, null)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -126,12 +150,11 @@ export async function GET(req) {
 
   const checkins = rows.map((row) => {
     const rosterAutoMatch = isDuesPayingMember(row.display_name);
-    const manual = Boolean(row.dues_verified_manual);
     const k = canonicalDuesKey(row.display_name);
     return {
       ...row,
       roster_auto_match: rosterAutoMatch,
-      dues_ok: rosterAutoMatch || manual,
+      dues_ok: isCheckinEligibleToVote(row.display_name, row.dues_verified_manual),
       name_duplicate: Boolean(k && (nameKeyCounts.get(k) || 0) > 1),
     };
   });
@@ -141,20 +164,18 @@ export async function GET(req) {
 
 /** PATCH — Admin: confirm dues-paid despite roster mismatch (clears flag in UI). */
 export async function PATCH(req) {
-  const pw = req.headers.get("x-admin-password");
-  if (pw !== process.env.ADMIN_PASSWORD) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   let body;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
+  if (!isAdminRequest(req, body)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
-  if (!deviceHash || deviceHash.length > 64) {
+  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
     return NextResponse.json({ error: "device_hash required" }, { status: 400 });
   }
 
@@ -164,34 +185,43 @@ export async function PATCH(req) {
 
   const supabase = getAdmin();
   const now = new Date().toISOString();
-  const { error } = await supabase
+  const { data: updatedRows, error } = await supabase
     .from("voter_checkins")
     .update({ dues_verified_manual: true, updated_at: now })
-    .eq("device_hash", deviceHash);
+    .eq("device_hash", deviceHash)
+    .select("device_hash");
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
+
+  if (!updatedRows?.length) {
+    return NextResponse.json({ error: "No check-in found for this device" }, { status: 404 });
+  }
+
+  await supabase.channel("election_room").send({
+    type: "broadcast",
+    event: "dues_verified",
+    payload: { device_hash: deviceHash },
+  });
 
   return NextResponse.json({ ok: true });
 }
 
 /** DELETE — Admin: remove a check-in row (e.g. no dues or policy violation). */
 export async function DELETE(req) {
-  const pw = req.headers.get("x-admin-password");
-  if (pw !== process.env.ADMIN_PASSWORD) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
   let body;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
+  if (!isAdminRequest(req, body)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
-  if (!deviceHash || deviceHash.length > 64) {
+  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
     return NextResponse.json({ error: "device_hash required" }, { status: 400 });
   }
 
