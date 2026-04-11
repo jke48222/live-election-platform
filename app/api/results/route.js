@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { isAdminRequest } from "../../../lib/admin-session";
 
 function getAdmin() {
   return createClient(
@@ -74,8 +75,7 @@ async function winnerRowForRole(supabase, role) {
 
 /** GET — Admin: ?role_id= → one role; else all completed roles. */
 export async function GET(req) {
-  const pw = req.headers.get("x-admin-password");
-  if (pw !== process.env.ADMIN_PASSWORD) {
+  if (!isAdminRequest(req, null)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

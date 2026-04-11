@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import {
+  adminCookieHeader,
+  clearAdminCookieHeader,
+  isAdminRequest,
+  signAdminSession,
+} from "../../../lib/admin-session";
+import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
 
 function getAdmin() {
   return createClient(
@@ -9,23 +16,42 @@ function getAdmin() {
   );
 }
 
-function checkAuth(req, body) {
-  const pw = body?.password || req.headers.get("x-admin-password");
-  return pw === process.env.ADMIN_PASSWORD;
-}
-
 export async function POST(req) {
-  const body = await req.json();
-  const { action } = body;
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  const { action } = body || {};
 
-  // Auth check
+  // Auth check: mint a signed session cookie on success
   if (action === "auth") {
-    return body.password === process.env.ADMIN_PASSWORD
-      ? NextResponse.json({ ok: true })
-      : NextResponse.json({ error: "Invalid password" }, { status: 401 });
+    // Brute-force throttle: 10 attempts / 60s / IP
+    const ip = clientIpFromReq(req);
+    const limited = rateLimit(`admin-auth:${ip}`, 10, 60 * 1000);
+    if (!limited.ok) {
+      return NextResponse.json(
+        { error: "Too many attempts. Try again shortly." },
+        { status: 429, headers: { "Retry-After": String(limited.retryAfter) } }
+      );
+    }
+    if (body.password !== process.env.ADMIN_PASSWORD) {
+      return NextResponse.json({ error: "Invalid password" }, { status: 401 });
+    }
+    const token = signAdminSession();
+    const res = NextResponse.json({ ok: true });
+    res.headers.set("Set-Cookie", adminCookieHeader(token));
+    return res;
   }
 
-  if (!checkAuth(req, body)) {
+  if (action === "logout") {
+    const res = NextResponse.json({ ok: true });
+    res.headers.set("Set-Cookie", clearAdminCookieHeader());
+    return res;
+  }
+
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -33,15 +59,20 @@ export async function POST(req) {
 
   /* ── LAUNCH POLL (PRD §4.2, §4.3) ── */
   if (action === "launch") {
-    const { role_id, duration = 60 } = body;
-
-    // Calculate absolute expiration timestamp
-    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+    const rawRoleId = typeof body.role_id === "string" ? body.role_id.trim() : "";
+    if (!rawRoleId) {
+      return NextResponse.json({ error: "role_id required" }, { status: 400 });
+    }
+    // F9: clamp duration to sane range
+    const rawDuration = Number(body.duration);
+    const duration = Number.isFinite(rawDuration)
+      ? Math.min(600, Math.max(5, Math.floor(rawDuration)))
+      : 60;
 
     const {
       data: stateRow,
       error: fetchErr,
-    } = await supabase.from("election_state").select("id").single();
+    } = await supabase.from("election_state").select("id, status").single();
 
     if (fetchErr || !stateRow) {
       return NextResponse.json(
@@ -50,11 +81,41 @@ export async function POST(req) {
       );
     }
 
+    // F2: require previous poll finalized before launching another
+    if (stateRow.status !== "waiting") {
+      return NextResponse.json(
+        { error: "Finalize or clear the current poll before launching another." },
+        { status: 409 }
+      );
+    }
+
+    // F1: verify the role exists and isn't already finalized
+    const { data: roleRow, error: roleErr } = await supabase
+      .from("roles")
+      .select("id, is_completed")
+      .eq("id", rawRoleId)
+      .maybeSingle();
+    if (roleErr) {
+      return NextResponse.json({ error: roleErr.message }, { status: 500 });
+    }
+    if (!roleRow) {
+      return NextResponse.json({ error: "Unknown role_id" }, { status: 404 });
+    }
+    if (roleRow.is_completed) {
+      return NextResponse.json(
+        { error: "This role is already finalized. Reset it first if you want to re-run." },
+        { status: 409 }
+      );
+    }
+
+    // Calculate absolute expiration timestamp
+    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+
     const { error } = await supabase
       .from("election_state")
       .update({
         status: "voting",
-        active_role_id: role_id,
+        active_role_id: rawRoleId,
         poll_expires_at: expiresAt,
         updated_at: new Date().toISOString(),
       })
@@ -68,7 +129,7 @@ export async function POST(req) {
       event: "state_change",
       payload: {
         status: "voting",
-        active_role_id: role_id,
+        active_role_id: rawRoleId,
         poll_expires_at: expiresAt,
       },
     });
@@ -158,7 +219,10 @@ export async function POST(req) {
 
   /* ── CLEAR VOTES & RESTART (tie-breaker — PRD §2.3) ── */
   if (action === "clear_restart") {
-    const { duration = 60 } = body;
+    const rawDuration = Number(body.duration);
+    const duration = Number.isFinite(rawDuration)
+      ? Math.min(600, Math.max(5, Math.floor(rawDuration)))
+      : 60;
     const { data: state, error: fetchErr } = await supabase
       .from("election_state")
       .select("*")
@@ -252,13 +316,21 @@ export async function POST(req) {
   if (action === "reset_all_results") {
     const { data: stateRow, error: fetchErr } = await supabase
       .from("election_state")
-      .select("id")
+      .select("id, status, active_role_id")
       .single();
 
     if (fetchErr || !stateRow) {
       return NextResponse.json(
         { error: fetchErr?.message || "No election_state row" },
         { status: 500 }
+      );
+    }
+
+    // F17: don't nuke votes mid-poll
+    if (stateRow.status !== "waiting" || stateRow.active_role_id) {
+      return NextResponse.json(
+        { error: "Finish the current poll before resetting the entire election." },
+        { status: 409 }
       );
     }
 

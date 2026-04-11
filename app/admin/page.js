@@ -11,18 +11,29 @@ import { sortCandidatesByLastName } from "../../lib/candidates-sort";
 function AdminLogin({ onLogin }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
   async function handleLogin() {
-    const res = await fetch("/api/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "auth", password }),
-    });
-    if (res.ok) {
-      sessionStorage.setItem("nsbe_admin_pw", password);
-      onLogin(password);
-    } else {
-      setError("Invalid password.");
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ action: "auth", password }),
+      });
+      if (res.ok) {
+        onLogin();
+      } else if (res.status === 429) {
+        setError("Too many attempts. Try again in a moment.");
+      } else {
+        setError("Invalid password.");
+      }
+    } catch {
+      setError("Network error. Check your connection.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -52,11 +63,11 @@ function AdminLogin({ onLogin }) {
         {error && <p className="text-uga-red text-sm mt-2 font-medium">{error}</p>}
         <button
           onClick={handleLogin}
-          disabled={!password}
+          disabled={!password || busy}
           className="w-full mt-4 h-14 rounded-xl bg-uga-red text-white font-bold text-lg
                      enabled:hover:bg-uga-red-dark disabled:opacity-40 transition-all"
         >
-          Log In
+          {busy ? "Signing in…" : "Log In"}
         </button>
       </div>
     </div>
@@ -66,8 +77,32 @@ function AdminLogin({ onLogin }) {
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    VOTE BAR CHART
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-function VoteBar({ name, count, total, isLeader }) {
+/** Distinct hues for bars / pie slices; stable per candidate via id hash. */
+const CANDIDATE_CHART_COLORS = [
+  "#BA0C2F",
+  "#1D4ED8",
+  "#047857",
+  "#B45309",
+  "#7C3AED",
+  "#BE185D",
+  "#0D9488",
+  "#CA8A04",
+  "#4338CA",
+  "#C2410C",
+  "#0369A1",
+  "#15803D",
+];
+
+function candidateChartColorForId(candidateId) {
+  const s = String(candidateId);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return CANDIDATE_CHART_COLORS[h % CANDIDATE_CHART_COLORS.length];
+}
+
+function VoteBar({ name, count, total, barColor, isLeader }) {
   const pct = total > 0 ? (count / total) * 100 : 0;
+  const fill = count === 0 ? "#E5E7EB" : barColor;
   return (
     <div className="flex items-center gap-3 py-1">
       <span className="w-36 truncate text-sm font-semibold text-uga-black">{name}</span>
@@ -77,7 +112,8 @@ function VoteBar({ name, count, total, isLeader }) {
           style={{
             "--bar-width": `${Math.max(pct, 2)}%`,
             width: `${Math.max(pct, 2)}%`,
-            backgroundColor: isLeader ? "#BA0C2F" : "#D1D5DB",
+            backgroundColor: fill,
+            boxShadow: isLeader && count > 0 ? "inset 0 0 0 2px rgba(17,24,39,0.35)" : undefined,
           }}
         />
       </div>
@@ -88,21 +124,18 @@ function VoteBar({ name, count, total, isLeader }) {
   );
 }
 
-const PIE_SLICE_COLORS = ["#4B5563", "#9CA3AF", "#78716C", "#6B7280", "#A8A29E", "#57534E"];
-
-/** SVG pie chart for live vote share (matches bar colors: leader UGA red). */
+/** SVG pie chart for live vote share (slice colors match VoteBar per candidate id). */
 function VotePieChart({ candidates, voteCounts, totalVotes, leaderIds }) {
   const active = candidates.filter((c) => c.is_active);
   const cx = 100;
   const cy = 100;
   const r = 88;
 
-  let colorIdx = 0;
   const segments = active.map((c) => {
     const count = voteCounts[c.id] || 0;
     const isLeader = leaderIds.includes(c.id);
-    const color = isLeader ? "#BA0C2F" : PIE_SLICE_COLORS[colorIdx++ % PIE_SLICE_COLORS.length];
-    return { id: c.id, name: c.name, count, color };
+    const color = candidateChartColorForId(c.id);
+    return { id: c.id, name: c.name, count, color, isLeader };
   });
 
   const label = segments
@@ -142,7 +175,15 @@ function VotePieChart({ candidates, voteCounts, totalVotes, leaderIds }) {
 
     if (frac >= 1 - 1e-6) {
       paths.push(
-        <circle key={s.id} cx={cx} cy={cy} r={r} fill={s.color} stroke="#fff" strokeWidth="1" />
+        <circle
+          key={s.id}
+          cx={cx}
+          cy={cy}
+          r={r}
+          fill={s.color}
+          stroke={s.isLeader ? "#111827" : "#fff"}
+          strokeWidth={s.isLeader ? 2.5 : 1}
+        />
       );
       break;
     }
@@ -153,7 +194,15 @@ function VotePieChart({ candidates, voteCounts, totalVotes, leaderIds }) {
     const y2 = cy + r * Math.sin(endAngle);
     const largeArc = endAngle - angle > Math.PI ? 1 : 0;
     const d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
-    paths.push(<path key={s.id} d={d} fill={s.color} stroke="#fff" strokeWidth="1" />);
+    paths.push(
+      <path
+        key={s.id}
+        d={d}
+        fill={s.color}
+        stroke={s.isLeader ? "#111827" : "#fff"}
+        strokeWidth={s.isLeader ? 2.5 : 1}
+      />
+    );
     angle = endAngle;
   }
 
@@ -217,7 +266,7 @@ function AdminCountdown({ expiresAt }) {
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    ADMIN DASHBOARD
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-function Dashboard({ password }) {
+function Dashboard({ onSessionExpired }) {
   const [roles, setRoles] = useState([]);
   const [electionState, setElectionState] = useState(null);
   const [candidates, setCandidates] = useState([]);
@@ -245,10 +294,9 @@ function Dashboard({ password }) {
   const supabase = useRef(null);
   const pollInterval = useRef(null);
 
-  const authHeaders = {
-    "Content-Type": "application/json",
-    "x-admin-password": password,
-  };
+  // Cookie-based auth: send credentials, JSON only in headers.
+  const jsonHeaders = { "Content-Type": "application/json" };
+  const fetchOpts = { credentials: "include" };
 
   /* ── Fetch all roles ── */
   const fetchRoles = useCallback(async () => {
@@ -282,35 +330,42 @@ function Dashboard({ password }) {
   /* ── Fetch vote counts (admin has SELECT on votes via service key) ── */
   const fetchVotes = useCallback(async (roleId) => {
     if (!roleId) { setVoteCounts({}); setTotalVotes(0); return; }
-    const res = await fetch(`/api/vote?role_id=${roleId}`, { headers: authHeaders });
-    if (res.ok) {
-      const data = await res.json();
-      setVoteCounts(data.counts || {});
-      setTotalVotes(data.total || 0);
+    try {
+      const res = await fetch(`/api/vote?role_id=${encodeURIComponent(roleId)}`, fetchOpts);
+      if (res.status === 401) { onSessionExpired(); return; }
+      if (res.ok) {
+        const data = await res.json();
+        setVoteCounts(data.counts || {});
+        setTotalVotes(data.total || 0);
+      }
+    } catch {
+      // network blip; next poll will retry
     }
-  }, [password]);
+  }, []);
 
   const fetchFinalResults = useCallback(async () => {
-    const res = await fetch("/api/results", {
-      headers: { "x-admin-password": password },
-    });
-    if (!res.ok) {
-      setFinalResultsError("Could not load final results.");
-      setFinalWinners([]);
-      return;
+    try {
+      const res = await fetch("/api/results", fetchOpts);
+      if (res.status === 401) { onSessionExpired(); return; }
+      if (!res.ok) {
+        setFinalResultsError("Could not load final results.");
+        setFinalWinners([]);
+        return;
+      }
+      const data = await res.json();
+      setFinalResultsError(null);
+      setFinalWinners(data.winners || []);
+    } catch {
+      setFinalResultsError("Network error loading final results.");
     }
-    const data = await res.json();
-    setFinalResultsError(null);
-    setFinalWinners(data.winners || []);
-  }, [password]);
+  }, []);
 
   const fetchCheckins = useCallback(async () => {
     setCheckinsLoading(true);
     setCheckinsError(null);
     try {
-      const res = await fetch("/api/checkin", {
-        headers: { "x-admin-password": password },
-      });
+      const res = await fetch("/api/checkin", fetchOpts);
+      if (res.status === 401) { onSessionExpired(); return; }
       const data = await res.json();
       if (!res.ok) {
         setCheckinsError(data.error || "Could not load member check-ins.");
@@ -318,10 +373,13 @@ function Dashboard({ password }) {
         return;
       }
       setMemberCheckins(data.checkins || []);
+    } catch {
+      setCheckinsError("Network error loading check-ins.");
+      setMemberCheckins([]);
     } finally {
       setCheckinsLoading(false);
     }
-  }, [password]);
+  }, []);
 
   const checkinDuesStats = useMemo(() => {
     let onRoster = 0;
@@ -348,23 +406,24 @@ function Dashboard({ password }) {
       try {
         const res = await fetch("/api/checkin", {
           method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-            "x-admin-password": password,
-          },
+          headers: jsonHeaders,
+          credentials: "include",
           body: JSON.stringify({ device_hash: deviceHash }),
         });
+        if (res.status === 401) { onSessionExpired(); return; }
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           alert(data.error || "Could not remove check-in.");
           return;
         }
         await fetchCheckins();
+      } catch {
+        alert("Network error removing check-in.");
       } finally {
         setCheckinRemovingHash(null);
       }
     },
-    [password, fetchCheckins]
+    [fetchCheckins]
   );
 
   const verifyCheckinDues = useCallback(
@@ -380,23 +439,24 @@ function Dashboard({ password }) {
       try {
         const res = await fetch("/api/checkin", {
           method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            "x-admin-password": password,
-          },
+          headers: jsonHeaders,
+          credentials: "include",
           body: JSON.stringify({ device_hash: deviceHash, verify_dues: true }),
         });
+        if (res.status === 401) { onSessionExpired(); return; }
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           alert(data.error || "Could not save verification.");
           return;
         }
         await fetchCheckins();
+      } catch {
+        alert("Network error confirming dues.");
       } finally {
         setCheckinVerifyingHash(null);
       }
     },
-    [password, fetchCheckins]
+    [fetchCheckins]
   );
 
   const loadHistoryRole = useCallback(
@@ -416,33 +476,39 @@ function Dashboard({ password }) {
           .eq("role_id", roleId);
         setHistoryCandidates(sortCandidatesByLastName(cands || []));
 
-        const vr = await fetch(`/api/vote?role_id=${encodeURIComponent(roleId)}`, {
-          headers: authHeaders,
-        });
-        if (vr.ok) {
-          const j = await vr.json();
-          setHistoryVoteCounts(j.counts || {});
-          setHistoryTotal(j.total || 0);
-        } else {
+        try {
+          const vr = await fetch(`/api/vote?role_id=${encodeURIComponent(roleId)}`, fetchOpts);
+          if (vr.status === 401) { onSessionExpired(); return; }
+          if (vr.ok) {
+            const j = await vr.json();
+            setHistoryVoteCounts(j.counts || {});
+            setHistoryTotal(j.total || 0);
+          } else {
+            setHistoryVoteCounts({});
+            setHistoryTotal(0);
+          }
+
+          const wr = await fetch(
+            `/api/results?role_id=${encodeURIComponent(roleId)}`,
+            fetchOpts
+          );
+          if (wr.status === 401) { onSessionExpired(); return; }
+          if (wr.ok) {
+            const j = await wr.json();
+            setHistoryWinner(j.winner ?? null);
+          } else {
+            setHistoryWinner(null);
+          }
+        } catch {
           setHistoryVoteCounts({});
           setHistoryTotal(0);
-        }
-
-        const wr = await fetch(
-          `/api/results?role_id=${encodeURIComponent(roleId)}`,
-          { headers: { "x-admin-password": password } }
-        );
-        if (wr.ok) {
-          const j = await wr.json();
-          setHistoryWinner(j.winner ?? null);
-        } else {
           setHistoryWinner(null);
         }
       } finally {
         setHistoryLoading(false);
       }
     },
-    [password]
+    []
   );
 
   useEffect(() => {
@@ -522,12 +588,18 @@ function Dashboard({ password }) {
         autoLockFired.current = true;
         fetch("/api/state", {
           method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({ action: "lock", password }),
-        }).then(() => {
-          fetchState();
-          fetchVotes(electionState.active_role_id);
-        });
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({ action: "lock" }),
+        })
+          .then(() => {
+            fetchState();
+            fetchVotes(electionState.active_role_id);
+          })
+          .catch(() => {
+            // F13: retry on next tick if network hiccup
+            autoLockFired.current = false;
+          });
       }
     }
     const id = setInterval(check, 500);
@@ -538,12 +610,21 @@ function Dashboard({ password }) {
   async function apiCall(action, body = {}) {
     setLoading(true);
     try {
-      const res = await fetch("/api/state", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ action, password, ...body }),
-      });
-      const data = await res.json();
+      let res;
+      try {
+        res = await fetch("/api/state", {
+          method: "POST",
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({ action, ...body }),
+        });
+      } catch {
+        // F12: surface network failures instead of silently advancing state
+        alert("Network error — check your connection and try again.");
+        return;
+      }
+      if (res.status === 401) { onSessionExpired(); return; }
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) alert(data.error || "Action failed");
       await fetchState();
       await fetchRoles();
@@ -581,11 +662,23 @@ function Dashboard({ password }) {
 
   /* ── Toggle candidate active status ── */
   async function toggleCandidate(candidateId, currentActive) {
-    await fetch("/api/candidates", {
-      method: "PATCH",
-      headers: authHeaders,
-      body: JSON.stringify({ id: candidateId, is_active: !currentActive, password }),
-    });
+    try {
+      const res = await fetch("/api/candidates", {
+        method: "PATCH",
+        headers: jsonHeaders,
+        credentials: "include",
+        body: JSON.stringify({ id: candidateId, is_active: !currentActive }),
+      });
+      if (res.status === 401) { onSessionExpired(); return; }
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(d.error || "Could not update candidate.");
+        return;
+      }
+    } catch {
+      alert("Network error updating candidate.");
+      return;
+    }
     if (electionState?.active_role_id) {
       await fetchCandidates(electionState.active_role_id);
     } else {
@@ -597,12 +690,25 @@ function Dashboard({ password }) {
   /* ── Add write-in candidate (PRD §2.3) ── */
   async function addCandidate() {
     const roleId = electionState?.active_role_id || selectedLaunchRoleId;
-    if (!roleId || !newCandidateName.trim()) return;
-    await fetch("/api/candidates", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ role_id: roleId, name: newCandidateName.trim(), password }),
-    });
+    const name = newCandidateName.trim();
+    if (!roleId || !name) return;
+    try {
+      const res = await fetch("/api/candidates", {
+        method: "POST",
+        headers: jsonHeaders,
+        credentials: "include",
+        body: JSON.stringify({ role_id: roleId, name }),
+      });
+      if (res.status === 401) { onSessionExpired(); return; }
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(d.error || "Could not add candidate.");
+        return;
+      }
+    } catch {
+      alert("Network error adding candidate.");
+      return;
+    }
     setNewCandidateName("");
     await fetchCandidates(roleId);
   }
@@ -618,12 +724,20 @@ function Dashboard({ password }) {
     }
     setLoading(true);
     try {
-      const res = await fetch("/api/candidates", {
-        method: "DELETE",
-        headers: authHeaders,
-        body: JSON.stringify({ id: c.id, password }),
-      });
-      const data = await res.json();
+      let res;
+      try {
+        res = await fetch("/api/candidates", {
+          method: "DELETE",
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({ id: c.id }),
+        });
+      } catch {
+        alert("Network error removing candidate.");
+        return;
+      }
+      if (res.status === 401) { onSessionExpired(); return; }
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         alert(data.error || "Could not remove candidate");
         return;
@@ -650,12 +764,20 @@ function Dashboard({ password }) {
     }
     setLoading(true);
     try {
-      const res = await fetch("/api/state", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ action: "reset_role", password, role_id: historyRoleId }),
-      });
-      const data = await res.json();
+      let res;
+      try {
+        res = await fetch("/api/state", {
+          method: "POST",
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({ action: "reset_role", role_id: historyRoleId }),
+        });
+      } catch {
+        alert("Network error.");
+        return;
+      }
+      if (res.status === 401) { onSessionExpired(); return; }
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         alert(data.error || "Reset failed");
         return;
@@ -679,12 +801,20 @@ function Dashboard({ password }) {
     }
     setLoading(true);
     try {
-      const res = await fetch("/api/state", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ action: "reset_all_results", password }),
-      });
-      const data = await res.json();
+      let res;
+      try {
+        res = await fetch("/api/state", {
+          method: "POST",
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({ action: "reset_all_results" }),
+        });
+      } catch {
+        alert("Network error.");
+        return;
+      }
+      if (res.status === 401) { onSessionExpired(); return; }
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         alert(data.error || "Reset failed");
         return;
@@ -702,19 +832,31 @@ function Dashboard({ password }) {
   async function seedDatabase() {
     if (!confirm("This will reset all data and seed the election slate. Continue?")) return;
     setLoading(true);
-    const res = await fetch("/api/seed", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ password }),
-    });
-    if (res.ok) {
-      alert("Database seeded successfully!");
-      await fetchRoles();
-      await fetchState();
-    } else {
-      alert("Seed failed.");
+    try {
+      let res;
+      try {
+        res = await fetch("/api/seed", {
+          method: "POST",
+          headers: jsonHeaders,
+          credentials: "include",
+          body: JSON.stringify({}),
+        });
+      } catch {
+        alert("Network error seeding database.");
+        return;
+      }
+      if (res.status === 401) { onSessionExpired(); return; }
+      if (res.ok) {
+        alert("Database seeded successfully!");
+        await fetchRoles();
+        await fetchState();
+      } else {
+        const d = await res.json().catch(() => ({}));
+        alert(d.error || "Seed failed.");
+      }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }
 
   /* ═══════════════════════════════════════════════
@@ -951,6 +1093,7 @@ function Dashboard({ password }) {
                     name={c.name}
                     count={voteCounts[c.id] || 0}
                     total={totalVotes}
+                    barColor={candidateChartColorForId(c.id)}
                     isLeader={leaders.includes(c.id)}
                   />
                 ))}
@@ -1015,6 +1158,7 @@ function Dashboard({ password }) {
                       name={c.name}
                       count={voteCounts[c.id] || 0}
                       total={totalVotes}
+                      barColor={candidateChartColorForId(c.id)}
                       isLeader={leaders.includes(c.id)}
                     />
                   ))}
@@ -1102,6 +1246,7 @@ function Dashboard({ password }) {
                         name={c.is_active ? c.name : `${c.name} (inactive)`}
                         count={historyVoteCounts[c.id] || 0}
                         total={Math.max(historyTotal, 1)}
+                        barColor={candidateChartColorForId(c.id)}
                         isLeader={historyLeaders.includes(c.id)}
                       />
                     ))}
@@ -1349,13 +1494,43 @@ function Dashboard({ password }) {
    ADMIN PAGE ENTRY
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 export default function AdminPage() {
-  const [password, setPassword] = useState(null);
+  // null = probing cookie, false = logged out, true = authed
+  const [authed, setAuthed] = useState(null);
 
   useEffect(() => {
-    const saved = sessionStorage.getItem("nsbe_admin_pw");
-    if (saved) setPassword(saved);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/results", { credentials: "include" });
+        if (!cancelled) setAuthed(res.ok);
+      } catch {
+        if (!cancelled) setAuthed(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
-  if (!password) return <AdminLogin onLogin={setPassword} />;
-  return <Dashboard password={password} />;
+  const handleSessionExpired = useCallback(async () => {
+    try {
+      await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ action: "logout" }),
+      });
+    } catch {
+      // best-effort; cookie will expire on its own
+    }
+    setAuthed(false);
+  }, []);
+
+  if (authed === null) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center bg-uga-gray">
+        <p className="text-sm text-uga-gray-mid">Loading…</p>
+      </div>
+    );
+  }
+  if (!authed) return <AdminLogin onLogin={() => setAuthed(true)} />;
+  return <Dashboard onSessionExpired={handleSessionExpired} />;
 }
