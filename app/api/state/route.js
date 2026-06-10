@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
 import {
   adminCookieHeader,
   clearAdminCookieHeader,
@@ -7,15 +6,15 @@ import {
   signAdminSession,
 } from "../../../lib/admin-session";
 import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
+import { withOrg } from "../../../lib/db";
+import { emit } from "../../../lib/realtime";
+import { resolveElectionOrg, isUuid, clampDuration } from "../../../lib/api-helpers";
 
-function getAdmin() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false } }
-  );
-}
-
+/**
+ * Election state machine — self-hosted Postgres + realtime NOTIFY.
+ * Every mutating action is scoped to one election (body.election_id) and
+ * runs inside withOrg() so RLS confines it to that election's organization.
+ */
 export async function POST(req) {
   let body;
   try {
@@ -25,9 +24,8 @@ export async function POST(req) {
   }
   const { action } = body || {};
 
-  // Auth check: mint a signed session cookie on success
+  // ── Auth: mint a signed session cookie ──
   if (action === "auth") {
-    // Brute-force throttle: 10 attempts / 60s / IP
     const ip = clientIpFromReq(req);
     const limited = rateLimit(`admin-auth:${ip}`, 10, 60 * 1000);
     if (!limited.ok) {
@@ -39,9 +37,8 @@ export async function POST(req) {
     if (body.password !== process.env.ADMIN_PASSWORD) {
       return NextResponse.json({ error: "Invalid password" }, { status: 401 });
     }
-    const token = signAdminSession();
     const res = NextResponse.json({ ok: true });
-    res.headers.set("Set-Cookie", adminCookieHeader(token));
+    res.headers.set("Set-Cookie", adminCookieHeader(signAdminSession()));
     return res;
   }
 
@@ -55,315 +52,190 @@ export async function POST(req) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const supabase = getAdmin();
-
-  /* ── LAUNCH POLL (PRD §4.2, §4.3) ── */
-  if (action === "launch") {
-    const rawRoleId = typeof body.role_id === "string" ? body.role_id.trim() : "";
-    if (!rawRoleId) {
-      return NextResponse.json({ error: "role_id required" }, { status: 400 });
-    }
-    // F9: clamp duration to sane range
-    const rawDuration = Number(body.duration);
-    const duration = Number.isFinite(rawDuration)
-      ? Math.min(600, Math.max(5, Math.floor(rawDuration)))
-      : 60;
-
-    const {
-      data: stateRow,
-      error: fetchErr,
-    } = await supabase.from("election_state").select("id, status").single();
-
-    if (fetchErr || !stateRow) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row — run DB seed/migration" },
-        { status: 500 }
-      );
-    }
-
-    // F2: require previous poll finalized before launching another
-    if (stateRow.status !== "waiting") {
-      return NextResponse.json(
-        { error: "Finalize or clear the current poll before launching another." },
-        { status: 409 }
-      );
-    }
-
-    // F1: verify the role exists and isn't already finalized
-    const { data: roleRow, error: roleErr } = await supabase
-      .from("roles")
-      .select("id, is_completed")
-      .eq("id", rawRoleId)
-      .maybeSingle();
-    if (roleErr) {
-      return NextResponse.json({ error: roleErr.message }, { status: 500 });
-    }
-    if (!roleRow) {
-      return NextResponse.json({ error: "Unknown role_id" }, { status: 404 });
-    }
-    if (roleRow.is_completed) {
-      return NextResponse.json(
-        { error: "This role is already finalized. Reset it first if you want to re-run." },
-        { status: 409 }
-      );
-    }
-
-    // Calculate absolute expiration timestamp
-    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
-
-    const { error } = await supabase
-      .from("election_state")
-      .update({
-        status: "voting",
-        active_role_id: rawRoleId,
-        poll_expires_at: expiresAt,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", stateRow.id);
-
-    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-
-    // Broadcast to all clients (PRD §4.2 — Broadcast API)
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "state_change",
-      payload: {
-        status: "voting",
-        active_role_id: rawRoleId,
-        poll_expires_at: expiresAt,
-      },
-    });
-
-    return NextResponse.json({ ok: true });
+  // All remaining actions are election-scoped.
+  const electionId = typeof body.election_id === "string" ? body.election_id.trim() : "";
+  if (!isUuid(electionId)) {
+    return NextResponse.json({ error: "election_id required" }, { status: 400 });
+  }
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) {
+    return NextResponse.json({ error: "Unknown election_id" }, { status: 404 });
   }
 
-  /* ── LOCK POLL EARLY (PRD §7.2) ── */
-  if (action === "lock") {
-    const { data: state, error: fetchErr } = await supabase
-      .from("election_state")
-      .select("*")
-      .single();
-
-    if (fetchErr || !state) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row — run DB seed/migration" },
-        { status: 500 }
+  try {
+    return await withOrg(orgId, async (db) => {
+      const { rows: eRows } = await db.query(
+        "SELECT id, status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
+        [electionId]
       );
-    }
+      const election = eRows[0];
+      if (!election) {
+        return NextResponse.json({ error: "Election not found" }, { status: 404 });
+      }
 
-    const { error } = await supabase
-      .from("election_state")
-      .update({
-        status: "locked",
-        poll_expires_at: new Date().toISOString(), // override to now()
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", state.id);
+      // ── LAUNCH a position's poll ──
+      if (action === "launch") {
+        const positionId =
+          typeof body.position_id === "string" ? body.position_id.trim() : "";
+        if (!isUuid(positionId)) {
+          return NextResponse.json({ error: "position_id required" }, { status: 400 });
+        }
+        // F2: previous poll must be finalized first.
+        if (election.status !== "waiting") {
+          return NextResponse.json(
+            { error: "Finalize or clear the current poll before launching another." },
+            { status: 409 }
+          );
+        }
+        // F1: position must belong to this election and not be completed.
+        const { rows: pRows } = await db.query(
+          "SELECT id, is_completed FROM positions WHERE id = $1 AND election_id = $2",
+          [positionId, electionId]
+        );
+        if (!pRows[0]) {
+          return NextResponse.json({ error: "Unknown position_id" }, { status: 404 });
+        }
+        if (pRows[0].is_completed) {
+          return NextResponse.json(
+            { error: "This position is already finalized. Reset it first to re-run." },
+            { status: 409 }
+          );
+        }
+        const duration = clampDuration(body.duration); // F9
+        const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+        await db.query(
+          `UPDATE elections SET status='voting', active_position_id=$1,
+             poll_expires_at=$2, updated_at=now() WHERE id=$3`,
+          [positionId, expiresAt, electionId]
+        );
+        await emit(db, electionId, "state_change", {
+          status: "voting",
+          active_position_id: positionId,
+          poll_expires_at: expiresAt,
+        });
+        return NextResponse.json({ ok: true });
+      }
 
-    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+      // ── LOCK the live poll early ──
+      if (action === "lock") {
+        const now = new Date().toISOString();
+        await db.query(
+          "UPDATE elections SET status='locked', poll_expires_at=$1, updated_at=now() WHERE id=$2",
+          [now, electionId]
+        );
+        await emit(db, electionId, "state_change", {
+          status: "locked",
+          active_position_id: election.active_position_id,
+          poll_expires_at: now,
+        });
+        return NextResponse.json({ ok: true });
+      }
 
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "state_change",
-      payload: {
-        status: "locked",
-        active_role_id: state.active_role_id,
-        poll_expires_at: new Date().toISOString(),
-      },
+      // ── FINALIZE the active position & advance ──
+      if (action === "finalize") {
+        if (election.active_position_id) {
+          await db.query("UPDATE positions SET is_completed=true WHERE id=$1", [
+            election.active_position_id,
+          ]);
+        }
+        // If every position is now complete, the election itself is complete.
+        const { rows: remaining } = await db.query(
+          "SELECT count(*)::int AS n FROM positions WHERE election_id=$1 AND is_completed=false",
+          [electionId]
+        );
+        const nextStatus = remaining[0].n === 0 ? "completed" : "waiting";
+        await db.query(
+          `UPDATE elections SET status=$1, active_position_id=NULL,
+             poll_expires_at=NULL, updated_at=now() WHERE id=$2`,
+          [nextStatus, electionId]
+        );
+        await emit(db, electionId, "state_change", {
+          status: nextStatus,
+          active_position_id: null,
+          poll_expires_at: null,
+        });
+        return NextResponse.json({ ok: true });
+      }
+
+      // ── CLEAR votes & relaunch (tie-breaker / runoff) ──
+      if (action === "clear_restart") {
+        if (!election.active_position_id) {
+          return NextResponse.json({ error: "No active position" }, { status: 400 });
+        }
+        const duration = clampDuration(body.duration);
+        await db.query("DELETE FROM votes WHERE position_id=$1", [
+          election.active_position_id,
+        ]);
+        const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+        await db.query(
+          "UPDATE elections SET status='voting', poll_expires_at=$1, updated_at=now() WHERE id=$2",
+          [expiresAt, electionId]
+        );
+        await emit(db, electionId, "purge", {
+          position_id: election.active_position_id,
+        });
+        await emit(db, electionId, "state_change", {
+          status: "voting",
+          active_position_id: election.active_position_id,
+          poll_expires_at: expiresAt,
+        });
+        return NextResponse.json({ ok: true });
+      }
+
+      // ── RESET one position (votes + un-finalize), room idle only ──
+      if (action === "reset_position") {
+        const positionId =
+          typeof body.position_id === "string" ? body.position_id.trim() : "";
+        if (!isUuid(positionId)) {
+          return NextResponse.json({ error: "position_id required" }, { status: 400 });
+        }
+        if (election.status !== "waiting" || election.active_position_id) {
+          return NextResponse.json(
+            { error: "Reset a position only when the room is waiting (no live or locked poll)." },
+            { status: 409 }
+          );
+        }
+        await db.query("DELETE FROM votes WHERE position_id=$1 AND election_id=$2", [
+          positionId,
+          electionId,
+        ]);
+        await db.query(
+          "UPDATE positions SET is_completed=false WHERE id=$1 AND election_id=$2",
+          [positionId, electionId]
+        );
+        await emit(db, electionId, "purge", { position_id: positionId });
+        return NextResponse.json({ ok: true });
+      }
+
+      // ── RESET the whole election (F17: not mid-poll) ──
+      if (action === "reset_all_results") {
+        if (election.status !== "waiting" || election.active_position_id) {
+          return NextResponse.json(
+            { error: "Finish the current poll before resetting the entire election." },
+            { status: 409 }
+          );
+        }
+        await db.query("DELETE FROM votes WHERE election_id=$1", [electionId]);
+        await db.query("UPDATE positions SET is_completed=false WHERE election_id=$1", [
+          electionId,
+        ]);
+        await db.query(
+          `UPDATE elections SET status='waiting', active_position_id=NULL,
+             poll_expires_at=NULL, updated_at=now() WHERE id=$1`,
+          [electionId]
+        );
+        await emit(db, electionId, "purge", { all: true });
+        await emit(db, electionId, "state_change", {
+          status: "waiting",
+          active_position_id: null,
+          poll_expires_at: null,
+        });
+        return NextResponse.json({ ok: true });
+      }
+
+      return NextResponse.json({ error: "Unknown action" }, { status: 400 });
     });
-
-    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-
-  /* ── FINALIZE ROLE & ADVANCE ── */
-  if (action === "finalize") {
-    const { data: state, error: fetchErr } = await supabase
-      .from("election_state")
-      .select("*")
-      .single();
-
-    if (fetchErr || !state) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row — run DB seed/migration" },
-        { status: 500 }
-      );
-    }
-
-    // Mark role as completed
-    if (state.active_role_id) {
-      await supabase
-        .from("roles")
-        .update({ is_completed: true })
-        .eq("id", state.active_role_id);
-    }
-
-    // Reset state to waiting
-    await supabase
-      .from("election_state")
-      .update({
-        status: "waiting",
-        active_role_id: null,
-        poll_expires_at: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", state.id);
-
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "state_change",
-      payload: { status: "waiting", active_role_id: null, poll_expires_at: null },
-    });
-
-    return NextResponse.json({ ok: true });
-  }
-
-  /* ── CLEAR VOTES & RESTART (tie-breaker — PRD §2.3) ── */
-  if (action === "clear_restart") {
-    const rawDuration = Number(body.duration);
-    const duration = Number.isFinite(rawDuration)
-      ? Math.min(600, Math.max(5, Math.floor(rawDuration)))
-      : 60;
-    const { data: state, error: fetchErr } = await supabase
-      .from("election_state")
-      .select("*")
-      .single();
-
-    if (fetchErr || !state) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row — run DB seed/migration" },
-        { status: 500 }
-      );
-    }
-
-    if (!state.active_role_id) {
-      return NextResponse.json({ error: "No active role" }, { status: 400 });
-    }
-
-    // DELETE all votes for this role
-    await supabase.from("votes").delete().eq("role_id", state.active_role_id);
-
-    // Relaunch
-    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
-    await supabase
-      .from("election_state")
-      .update({
-        status: "voting",
-        poll_expires_at: expiresAt,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", state.id);
-
-    // Broadcast purge event to clear client LocalStorage (PRD §2.3)
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "purge",
-      payload: { type: "purge", role_id: state.active_role_id },
-    });
-
-    // Then broadcast new state
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "state_change",
-      payload: {
-        status: "voting",
-        active_role_id: state.active_role_id,
-        poll_expires_at: expiresAt,
-      },
-    });
-
-    return NextResponse.json({ ok: true });
-  }
-
-  /* ── RESET ONE ROLE (votes + un-finalize) — admin only, room idle ── */
-  if (action === "reset_role") {
-    const { role_id } = body;
-    if (!role_id) {
-      return NextResponse.json({ error: "role_id required" }, { status: 400 });
-    }
-
-    const { data: state, error: fetchErr } = await supabase
-      .from("election_state")
-      .select("*")
-      .single();
-
-    if (fetchErr || !state) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row" },
-        { status: 500 }
-      );
-    }
-
-    if (state.status !== "waiting" || state.active_role_id) {
-      return NextResponse.json(
-        { error: "Reset a poll only when the room is waiting (no live or locked poll)." },
-        { status: 400 }
-      );
-    }
-
-    await supabase.from("votes").delete().eq("role_id", role_id);
-    await supabase.from("roles").update({ is_completed: false }).eq("id", role_id);
-
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "purge",
-      payload: { type: "purge", role_id },
-    });
-
-    return NextResponse.json({ ok: true });
-  }
-
-  /* ── RESET ALL RESULTS (all votes, all roles open, waiting) ── */
-  if (action === "reset_all_results") {
-    const { data: stateRow, error: fetchErr } = await supabase
-      .from("election_state")
-      .select("id, status, active_role_id")
-      .single();
-
-    if (fetchErr || !stateRow) {
-      return NextResponse.json(
-        { error: fetchErr?.message || "No election_state row" },
-        { status: 500 }
-      );
-    }
-
-    // F17: don't nuke votes mid-poll
-    if (stateRow.status !== "waiting" || stateRow.active_role_id) {
-      return NextResponse.json(
-        { error: "Finish the current poll before resetting the entire election." },
-        { status: 409 }
-      );
-    }
-
-    await supabase
-      .from("votes")
-      .delete()
-      .neq("id", "00000000-0000-0000-0000-000000000000");
-    await supabase.from("roles").update({ is_completed: false }).neq("id", "____");
-
-    await supabase
-      .from("election_state")
-      .update({
-        status: "waiting",
-        active_role_id: null,
-        poll_expires_at: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", stateRow.id);
-
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "purge",
-      payload: { type: "purge", all: true },
-    });
-
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "state_change",
-      payload: { status: "waiting", active_role_id: null, poll_expires_at: null },
-    });
-
-    return NextResponse.json({ ok: true });
-  }
-
-  return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }

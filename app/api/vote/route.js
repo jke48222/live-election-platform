@@ -1,18 +1,20 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import { isCheckinEligibleToVote } from "../../../lib/dues-roster";
 import { isAdminRequest } from "../../../lib/admin-session";
 import { rateLimit } from "../../../lib/rate-limit";
+import { withOrg } from "../../../lib/db";
+import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
 
-function getAdmin() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false } }
-  );
-}
-
-/** POST — Voter: cast vote (server enforces check-in, dues, poll window, candidate). */
+/**
+ * POST /api/vote — cast a vote. Server enforces eligibility, the poll window,
+ * candidate validity, and one-vote-per-voter (DB unique constraint).
+ *
+ * Eligibility is generalized from the NSBE dues roster into the election's
+ * eligibility_mode:
+ *   - open                : no check-in required
+ *   - pin / access_code   : a check-in row must exist for this device
+ *   - roster_csv / email / sso : check-in must exist AND be verified
+ * (Phase 5 fills in roster matching / magic links / SSO; this is the gate.)
+ */
 export async function POST(req) {
   let body;
   try {
@@ -21,23 +23,23 @@ export async function POST(req) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const roleId = typeof body?.role_id === "string" ? body.role_id.trim() : "";
+  const electionId = typeof body?.election_id === "string" ? body.election_id.trim() : "";
+  const positionId = typeof body?.position_id === "string" ? body.position_id.trim() : "";
   const candidateId = typeof body?.candidate_id === "string" ? body.candidate_id.trim() : "";
   const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
 
-  // F8: require exact 64-char lowercase hex SHA-256 hash
-  if (!roleId || !candidateId || !/^[0-9a-f]{64}$/.test(deviceHash)) {
+  if (!isUuid(electionId) || !isUuid(positionId) || !isUuid(candidateId)) {
     return NextResponse.json(
-      { error: "role_id, candidate_id, and a valid device_hash are required." },
+      { error: "election_id, position_id and candidate_id are required." },
       { status: 400 }
     );
   }
-  // candidate_id must be a UUID
-  if (!/^[0-9a-f-]{36}$/i.test(candidateId)) {
-    return NextResponse.json({ error: "Invalid candidate_id." }, { status: 400 });
+  // F8: exact 64-char lowercase hex device hash.
+  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
+    return NextResponse.json({ error: "A valid device_hash is required." }, { status: 400 });
   }
 
-  // F14: throttle per device — 20 vote attempts / 10s
+  // F14: throttle per device.
   const limited = rateLimit(`vote:${deviceHash}`, 20, 10_000);
   if (!limited.ok) {
     return NextResponse.json(
@@ -46,111 +48,116 @@ export async function POST(req) {
     );
   }
 
-  const supabase = getAdmin();
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
-  const { data: checkin, error: checkinErr } = await supabase
-    .from("voter_checkins")
-    .select("display_name, dues_verified_manual")
-    .eq("device_hash", deviceHash)
-    .maybeSingle();
+  try {
+    return await withOrg(orgId, async (db) => {
+      const { rows: eRows } = await db.query(
+        `SELECT status, active_position_id, poll_expires_at, eligibility_mode
+           FROM elections WHERE id = $1`,
+        [electionId]
+      );
+      const election = eRows[0];
+      if (!election) return NextResponse.json({ error: "Election not found" }, { status: 404 });
 
-  if (checkinErr) {
-    return NextResponse.json({ error: checkinErr.message }, { status: 500 });
+      // Poll window.
+      if (election.status !== "voting") {
+        return NextResponse.json({ error: "Voting is not open for this poll." }, { status: 403 });
+      }
+      if (election.active_position_id !== positionId) {
+        return NextResponse.json({ error: "This race is not the active poll." }, { status: 403 });
+      }
+      if (
+        election.poll_expires_at &&
+        new Date(election.poll_expires_at).getTime() <= Date.now()
+      ) {
+        return NextResponse.json({ error: "Voting time has expired." }, { status: 403 });
+      }
+
+      // Eligibility gate.
+      const mode = election.eligibility_mode;
+      if (mode !== "open") {
+        const { rows: cRows } = await db.query(
+          "SELECT verified FROM checkins WHERE election_id=$1 AND device_hash=$2",
+          [electionId, deviceHash]
+        );
+        const checkin = cRows[0];
+        if (!checkin) {
+          return NextResponse.json(
+            { error: "Not checked in. Rejoin from the start screen.", code: "not_checked_in" },
+            { status: 403 }
+          );
+        }
+        const needsVerify = mode === "roster_csv" || mode === "email_magic_link" || mode === "sso_oidc";
+        if (needsVerify && !checkin.verified) {
+          return NextResponse.json(
+            {
+              error: "Your eligibility hasn't been confirmed yet. Wait for the host to verify you.",
+              code: "verification_required",
+            },
+            { status: 403 }
+          );
+        }
+      }
+
+      // Candidate must belong to the active position and be active.
+      const { rows: candRows } = await db.query(
+        "SELECT 1 FROM candidates WHERE id=$1 AND position_id=$2 AND is_active=true",
+        [candidateId, positionId]
+      );
+      if (!candRows[0]) {
+        return NextResponse.json({ error: "Invalid candidate for this race." }, { status: 400 });
+      }
+
+      // Insert vote; voter_identity is the device hash for device-based modes.
+      try {
+        await db.query(
+          `INSERT INTO votes (election_id, org_id, position_id, candidate_id, voter_identity)
+           VALUES ($1, nullif(current_setting('app.current_org',true),'')::uuid, $2, $3, $4)`,
+          [electionId, positionId, candidateId, deviceHash]
+        );
+      } catch (err) {
+        if (err.code === "23505") return NextResponse.json({ ok: true, duplicate: true });
+        throw err;
+      }
+      return NextResponse.json({ ok: true });
+    });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-  if (!checkin) {
-    return NextResponse.json(
-      { error: "Not checked in. Rejoin the room from the login screen.", code: "not_checked_in" },
-      { status: 403 }
-    );
-  }
-
-  if (!isCheckinEligibleToVote(checkin.display_name, checkin.dues_verified_manual)) {
-    return NextResponse.json(
-      {
-        error:
-          "Your name is not on the automated dues list yet. Wait until an admin confirms your dues in the host dashboard.",
-        code: "dues_required",
-      },
-      { status: 403 }
-    );
-  }
-
-  const { data: state, error: stateErr } = await supabase.from("election_state").select("*").single();
-  if (stateErr || !state) {
-    return NextResponse.json(
-      { error: stateErr?.message || "Election state unavailable." },
-      { status: 500 }
-    );
-  }
-
-  if (state.status !== "voting") {
-    return NextResponse.json({ error: "Voting is not open for this poll." }, { status: 403 });
-  }
-  if (state.active_role_id !== roleId) {
-    return NextResponse.json({ error: "This race is not the active poll." }, { status: 403 });
-  }
-  if (
-    state.poll_expires_at &&
-    new Date(state.poll_expires_at).getTime() <= Date.now()
-  ) {
-    return NextResponse.json({ error: "Voting time has expired." }, { status: 403 });
-  }
-
-  const { data: cand, error: candErr } = await supabase
-    .from("candidates")
-    .select("id")
-    .eq("id", candidateId)
-    .eq("role_id", roleId)
-    .eq("is_active", true)
-    .maybeSingle();
-
-  if (candErr || !cand) {
-    return NextResponse.json({ error: "Invalid candidate for this race." }, { status: 400 });
-  }
-
-  const { error: insErr } = await supabase.from("votes").insert({
-    role_id: roleId,
-    candidate_id: candidateId,
-    device_hash: deviceHash,
-  });
-
-  if (insErr) {
-    if (insErr.code === "23505") {
-      return NextResponse.json({ ok: true, duplicate: true });
-    }
-    return NextResponse.json({ error: insErr.message }, { status: 500 });
-  }
-
-  return NextResponse.json({ ok: true });
 }
 
-/* GET /api/vote?role_id=xxx — Admin: fetch vote counts per candidate */
+/** GET /api/vote?election_id=&position_id= — admin: live counts per candidate. */
 export async function GET(req) {
   if (!isAdminRequest(req, null)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
   const { searchParams } = new URL(req.url);
-  const roleId = searchParams.get("role_id");
-  if (!roleId) return NextResponse.json({ error: "role_id required" }, { status: 400 });
-
-  const supabase = getAdmin();
-
-  const { data: votes, error } = await supabase
-    .from("votes")
-    .select("candidate_id")
-    .eq("role_id", roleId);
-
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
-
-  // Aggregate counts
-  const counts = {};
-  for (const v of votes || []) {
-    counts[v.candidate_id] = (counts[v.candidate_id] || 0) + 1;
+  const electionId = searchParams.get("election_id") || "";
+  const positionId = searchParams.get("position_id") || "";
+  if (!isUuid(electionId) || !isUuid(positionId)) {
+    return NextResponse.json({ error: "election_id and position_id required" }, { status: 400 });
   }
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
-  return NextResponse.json({
-    counts,
-    total: votes?.length || 0,
-  });
+  try {
+    const { counts, total } = await withOrg(orgId, async (db) => {
+      const { rows } = await db.query(
+        "SELECT candidate_id, count(*)::int AS n FROM votes WHERE position_id=$1 GROUP BY candidate_id",
+        [positionId]
+      );
+      const counts = {};
+      let total = 0;
+      for (const r of rows) {
+        counts[r.candidate_id] = r.n;
+        total += r.n;
+      }
+      return { counts, total };
+    });
+    return NextResponse.json({ counts, total });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
 }
