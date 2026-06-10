@@ -4,8 +4,10 @@ import { withOrg } from "../../../lib/db";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
 
 /**
- * GET /api/candidates?election_id=&position_id=  — public, active candidates.
- * Replaces the voter page's direct Supabase read of the candidates table.
+ * GET /api/candidates?election_id=&position_id=
+ *   - voters (no session): active candidates only.
+ *   - admins (valid session): ALL candidates incl. inactive + is_active flag,
+ *     so the pre-poll checklist can toggle them back on.
  */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -17,12 +19,14 @@ export async function GET(req) {
   const orgId = await resolveElectionOrg(electionId);
   if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
+  const admin = isAdminRequest(req, null);
   try {
     const candidates = await withOrg(orgId, async (db) => {
+      const activeFilter = admin ? "" : "AND c.is_active = true";
       const { rows } = await db.query(
-        `SELECT c.id, c.name, c.bio, c.photo_url, c.sort_order
+        `SELECT c.id, c.name, c.bio, c.photo_url, c.is_active, c.sort_order
            FROM candidates c JOIN positions p ON p.id = c.position_id
-           WHERE c.position_id = $1 AND p.election_id = $2 AND c.is_active = true
+           WHERE c.position_id = $1 AND p.election_id = $2 ${activeFilter}
            ORDER BY c.sort_order, c.name`,
         [positionId, electionId]
       );
