@@ -51,6 +51,7 @@ async function main() {
   ok(true, "voter WS subscribed to election room");
 
   // Clean slate, then launch via the real API route.
+  await api("/api/state", { method: "POST", admin: true, body: { action: "finalize", election_id: electionId } });
   await api("/api/state", { method: "POST", admin: true, body: { action: "reset_all_results", election_id: electionId } });
   await wait(200);
   events.length = 0;
@@ -64,7 +65,8 @@ async function main() {
   ok(stateChange?.data?.status === "voting" && stateChange?.data?.active_position_id === positionId,
     "state_change payload carries voting + active_position_id");
 
-  // cleanup
+  // cleanup → leave the election in a clean waiting state
+  await api("/api/state", { method: "POST", admin: true, body: { action: "finalize", election_id: electionId } });
   await api("/api/state", { method: "POST", admin: true, body: { action: "reset_all_results", election_id: electionId } });
   ws.close();
 
