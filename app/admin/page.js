@@ -406,6 +406,38 @@ function AdminCountdown({ expiresAt }) {
   );
 }
 
+/* ── Eligibility list (roster entries or access codes) ── */
+function RosterList({ entries, onRemove, onClear, showToken }) {
+  if (!entries || entries.length === 0) {
+    return <p className="text-xs text-uga-gray-mid mt-3">No entries yet.</p>;
+  }
+  const used = entries.filter((e) => e.used_at).length;
+  return (
+    <div className="mt-3">
+      <div className="flex items-center justify-between mb-1">
+        <p className="text-xs font-bold text-uga-black">
+          {entries.length} {showToken ? "codes" : "entries"}
+          {showToken ? ` · ${used} used` : ""}
+        </p>
+        <button onClick={onClear} className="text-xs font-bold text-uga-red hover:underline">Clear all</button>
+      </div>
+      <ul className="max-h-48 overflow-y-auto space-y-1 border border-gray-100 rounded-xl p-2 bg-gray-50/50">
+        {entries.map((e) => (
+          <li key={e.id} className="flex items-center justify-between gap-2 text-sm px-1">
+            <span className="font-mono truncate text-uga-black">
+              {showToken ? e.token : e.identifier}
+              {e.used_at && (
+                <span className="ml-2 text-[10px] uppercase font-bold text-amber-800 bg-amber-100 px-1 rounded">used</span>
+              )}
+            </span>
+            <button onClick={() => onRemove(e.id)} className="text-xs text-uga-red hover:underline shrink-0">remove</button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    DASHBOARD
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
@@ -441,6 +473,12 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
   const [builderLoading, setBuilderLoading] = useState(false);
   const [newPositionTitle, setNewPositionTitle] = useState("");
   const [newCandidateByPos, setNewCandidateByPos] = useState({});
+
+  // Voter eligibility
+  const [rosterEntries, setRosterEntries] = useState([]);
+  const [rosterText, setRosterText] = useState("");
+  const [genCount, setGenCount] = useState(25);
+  const [pinDraft, setPinDraft] = useState("");
 
   const pollInterval = useRef(null);
   const jsonHeaders = { "Content-Type": "application/json" };
@@ -958,6 +996,52 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
     }
   }
 
+  /* ── Voter eligibility ── */
+  const fetchRoster = useCallback(async () => {
+    if (!electionId) return;
+    const res = await fetch(`/api/roster?election_id=${electionId}`, fetchOpts);
+    if (res.status === 401) return onSessionExpired();
+    const data = await res.json().catch(() => ({}));
+    setRosterEntries(data.entries || []);
+  }, [electionId, onSessionExpired]);
+
+  async function changeEligibility(mode) {
+    if (await builderApi("PATCH", "/api/elections", { election_id: electionId, eligibility_mode: mode })) {
+      await fetchElection();
+      await fetchRoster();
+    }
+  }
+  async function savePin() {
+    if (!pinDraft.trim()) return;
+    if (await builderApi("PATCH", "/api/elections", { election_id: electionId, pin: pinDraft.trim() })) {
+      setPinDraft("");
+      await fetchElection();
+    }
+  }
+  async function addRoster() {
+    const text = rosterText.trim();
+    if (!text) return;
+    const r = await builderApi("POST", "/api/roster", { election_id: electionId, text });
+    if (r) {
+      setRosterText("");
+      await fetchRoster();
+      if (typeof r.added === "number") alert(`Added ${r.added} of ${r.submitted} (duplicates skipped).`);
+    }
+  }
+  async function generateCodes() {
+    const n = Math.max(1, Math.min(2000, Number(genCount) || 0));
+    if (await builderApi("POST", "/api/roster", { election_id: electionId, generate_codes: n })) {
+      await fetchRoster();
+    }
+  }
+  async function removeRosterEntry(id) {
+    if (await builderApi("DELETE", "/api/roster", { election_id: electionId, id })) await fetchRoster();
+  }
+  async function clearRoster() {
+    if (!confirm("Clear the entire eligibility list?")) return;
+    if (await builderApi("DELETE", "/api/roster", { election_id: electionId, all: true })) await fetchRoster();
+  }
+
   /* ═══════════ RENDER ═══════════ */
   const status = election?.status || "waiting";
   const currentPosition = getCurrentPosition();
@@ -977,6 +1061,11 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
   useEffect(() => {
     if (status === "waiting" || status === "draft") fetchBuilder();
   }, [status, fetchBuilder]);
+
+  /* Load the eligibility list while the election is idle. */
+  useEffect(() => {
+    if (status === "waiting" || status === "draft") fetchRoster();
+  }, [status, fetchRoster]);
 
   const maxVotes = Math.max(...Object.values(voteCounts), 0);
   const leaders = Object.entries(voteCounts).filter(([, c]) => c === maxVotes && maxVotes > 0).map(([id]) => id);
@@ -1131,6 +1220,95 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
               />
               <button onClick={addPosition} disabled={!newPositionTitle.trim()} className="h-11 px-5 rounded-xl bg-uga-red text-white font-bold disabled:opacity-40">Add position</button>
             </div>
+          </section>
+        )}
+
+        {/* Voter eligibility */}
+        {(status === "waiting" || status === "draft") && (
+          <section className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+            <h2 className="font-display font-black text-lg text-uga-black mb-3">Voter eligibility</h2>
+            <label htmlFor="elig-mode" className="block text-sm font-semibold text-uga-black mb-1">
+              How voters are verified
+            </label>
+            <select
+              id="elig-mode"
+              value={election?.eligibility_mode || "pin"}
+              onChange={(e) => changeEligibility(e.target.value)}
+              className="w-full h-12 px-4 rounded-xl border-2 border-gray-200 bg-white font-semibold focus:border-uga-red"
+            >
+              <option value="open">Open — anyone with the link</option>
+              <option value="pin">Room PIN</option>
+              <option value="roster_csv">Roster — match a list of names</option>
+              <option value="email_magic_link">Email allowlist</option>
+              <option value="access_code">Single-use access codes</option>
+            </select>
+
+            {election?.eligibility_mode === "open" && (
+              <p className="text-sm text-uga-gray-mid mt-3">Anyone with the voter link can vote — no check-in.</p>
+            )}
+
+            {election?.eligibility_mode === "pin" && (
+              <div className="mt-3 flex gap-2 items-end">
+                <div className="flex-1">
+                  <label className="block text-xs font-semibold text-uga-gray-mid mb-1">
+                    Room PIN (current: <span className="font-mono text-uga-black">{election?.pin || "—"}</span>)
+                  </label>
+                  <input
+                    value={pinDraft}
+                    onChange={(e) => setPinDraft(e.target.value.replace(/\D/g, "").slice(0, 8))}
+                    placeholder="New PIN"
+                    inputMode="numeric"
+                    className="w-full h-11 px-3 rounded-lg border-2 border-gray-200 focus:border-uga-red text-center tracking-widest font-bold"
+                  />
+                </div>
+                <button onClick={savePin} disabled={!pinDraft.trim()} className="h-11 px-4 rounded-lg bg-uga-black text-white font-semibold disabled:opacity-30">
+                  Save PIN
+                </button>
+              </div>
+            )}
+
+            {(election?.eligibility_mode === "roster_csv" || election?.eligibility_mode === "email_magic_link") && (
+              <div className="mt-4">
+                <p className="text-sm text-uga-gray-mid mb-2">
+                  {election.eligibility_mode === "email_magic_link"
+                    ? "Paste eligible emails, one per line. Only these emails can vote."
+                    : "Paste eligible names, one per line. Matching names are auto-verified; others wait for your manual verify."}
+                </p>
+                <textarea
+                  value={rosterText}
+                  onChange={(e) => setRosterText(e.target.value)}
+                  rows={4}
+                  placeholder={election.eligibility_mode === "email_magic_link" ? "ada@example.com\nalan@example.com" : "Ada Lovelace\nAlan Turing"}
+                  className="w-full px-3 py-2 rounded-xl border-2 border-gray-200 focus:border-uga-red text-sm font-mono"
+                />
+                <button onClick={addRoster} disabled={!rosterText.trim()} className="mt-2 h-11 px-5 rounded-xl bg-uga-red text-white font-bold disabled:opacity-40">
+                  Add to list
+                </button>
+                <RosterList entries={rosterEntries} onRemove={removeRosterEntry} onClear={clearRoster} showToken={false} />
+              </div>
+            )}
+
+            {election?.eligibility_mode === "access_code" && (
+              <div className="mt-4">
+                <p className="text-sm text-uga-gray-mid mb-2">
+                  Generate single-use codes and hand them out. Each code works on one device.
+                </p>
+                <div className="flex gap-2 items-end">
+                  <input
+                    type="number"
+                    min={1}
+                    max={2000}
+                    value={genCount}
+                    onChange={(e) => setGenCount(Number(e.target.value))}
+                    className="w-28 h-11 px-3 rounded-lg border-2 border-gray-200 focus:border-uga-red text-center font-bold"
+                  />
+                  <button onClick={generateCodes} className="h-11 px-5 rounded-xl bg-uga-red text-white font-bold">
+                    Generate codes
+                  </button>
+                </div>
+                <RosterList entries={rosterEntries} onRemove={removeRosterEntry} onClear={clearRoster} showToken={true} />
+              </div>
+            )}
           </section>
         )}
 
