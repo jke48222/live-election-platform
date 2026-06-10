@@ -1,26 +1,24 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import {
-  canonicalDuesKey,
-  isCheckinEligibleToVote,
-  isDuesPayingMember,
-} from "../../../lib/dues-roster";
 import { isAdminRequest } from "../../../lib/admin-session";
 import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
-
-function getAdmin() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false } }
-  );
-}
+import { withOrg } from "../../../lib/db";
+import { emit } from "../../../lib/realtime";
+import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
 
 const MAX_NAME = 255;
 
-/** POST — Register voter identity after PIN (same PIN as room). */
+/** Normalize a display name for same-name duplicate detection. */
+function nameKey(name) {
+  return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Modes where a voter must be verified before they can vote. */
+function needsVerification(mode) {
+  return mode === "roster_csv" || mode === "email_magic_link" || mode === "sso_oidc";
+}
+
+/** POST — voter registers identity for an election (PIN-gated when applicable). */
 export async function POST(req) {
-  // F14: throttle check-in attempts per IP — protects PIN and roster lookup
   const ip = clientIpFromReq(req);
   const limited = rateLimit(`checkin:${ip}`, 20, 60_000);
   if (!limited.ok) {
@@ -36,133 +34,112 @@ export async function POST(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  const { display_name, device_hash, pin } = body;
+  const { election_id: electionId, display_name, device_hash: deviceHash, pin } = body || {};
 
-  if (!pin || pin !== process.env.NEXT_PUBLIC_ROOM_PIN) {
-    return NextResponse.json({ error: "Invalid room PIN" }, { status: 401 });
+  if (!isUuid(electionId)) {
+    return NextResponse.json({ error: "election_id required" }, { status: 400 });
   }
-
   const name = typeof display_name === "string" ? display_name.trim() : "";
   if (!name || name.length > MAX_NAME) {
-    return NextResponse.json(
-      { error: "Name is required (max 255 characters)." },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Name is required (max 255 characters)." }, { status: 400 });
   }
-
-  if (typeof device_hash !== "string" || !/^[0-9a-f]{64}$/.test(device_hash)) {
+  if (typeof deviceHash !== "string" || !/^[0-9a-f]{64}$/.test(deviceHash)) {
     return NextResponse.json({ error: "Invalid device identifier" }, { status: 400 });
   }
 
-  const nameKey = canonicalDuesKey(name);
-  if (!nameKey) {
-    return NextResponse.json(
-      { error: "Please enter your first and last name as on the roster." },
-      { status: 400 }
-    );
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+
+  try {
+    return await withOrg(orgId, async (db) => {
+      const { rows: eRows } = await db.query(
+        "SELECT eligibility_mode, pin FROM elections WHERE id=$1",
+        [electionId]
+      );
+      const election = eRows[0];
+      if (!election) return NextResponse.json({ error: "Election not found" }, { status: 404 });
+
+      if (election.eligibility_mode === "pin" && pin !== election.pin) {
+        return NextResponse.json({ error: "Invalid room PIN" }, { status: 401 });
+      }
+
+      // Block the same name held on a different device in this election.
+      const key = nameKey(name);
+      const { rows: dupes } = await db.query(
+        "SELECT device_hash, display_name FROM checkins WHERE election_id=$1 AND device_hash<>$2",
+        [electionId, deviceHash]
+      );
+      if (dupes.some((r) => nameKey(r.display_name) === key)) {
+        return NextResponse.json(
+          { error: "This name is already checked in on another device." },
+          { status: 409 }
+        );
+      }
+
+      const verified = !needsVerification(election.eligibility_mode);
+      // Re-checking in with a new name on the same device resets verification.
+      const orgExpr = "nullif(current_setting('app.current_org',true),'')::uuid";
+      await db.query(
+        `INSERT INTO checkins (election_id, org_id, device_hash, display_name, verified)
+           VALUES ($1, ${orgExpr}, $2, $3, $4)
+         ON CONFLICT (election_id, device_hash) DO UPDATE
+           SET display_name = EXCLUDED.display_name,
+               verified = CASE WHEN checkins.display_name <> EXCLUDED.display_name
+                               THEN $4 ELSE checkins.verified END,
+               updated_at = now()`,
+        [electionId, deviceHash, name, verified]
+      );
+
+      return NextResponse.json({ ok: true, verified });
+    });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-
-  const supabase = getAdmin();
-
-  const { data: existingRows, error: existingErr } = await supabase
-    .from("voter_checkins")
-    .select("device_hash, display_name, dues_verified_manual");
-
-  if (existingErr) {
-    return NextResponse.json({ error: existingErr.message }, { status: 500 });
-  }
-
-  const takenByOther = (existingRows || []).some(
-    (row) => canonicalDuesKey(row.display_name) === nameKey && row.device_hash !== device_hash
-  );
-  if (takenByOther) {
-    return NextResponse.json(
-      {
-        error:
-          "This name is already checked in on another device. Use that device, or ask an admin to remove the other check-in.",
-      },
-      { status: 409 }
-    );
-  }
-
-  const existingForDevice = (existingRows || []).find((row) => row.device_hash === device_hash);
-  const priorKey = existingForDevice
-    ? canonicalDuesKey(existingForDevice.display_name)
-    : null;
-  /* Admin "Confirm dues" sets dues_verified_manual. If the voter changes their checked-in name
-     on the same device, we must clear it — otherwise non-roster names still show dues_ok. */
-  const nameIdentityChanged = priorKey !== null && priorKey !== nameKey;
-
-  const now = new Date().toISOString();
-
-  const upsertRow = {
-    device_hash,
-    display_name: name,
-    updated_at: now,
-  };
-  if (nameIdentityChanged) {
-    upsertRow.dues_verified_manual = false;
-  }
-
-  const { error } = await supabase.from("voter_checkins").upsert(upsertRow, {
-    onConflict: "device_hash",
-  });
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
-  }
-
-  const rosterMatch = isDuesPayingMember(name);
-  const manualCarriesOver =
-    !nameIdentityChanged && Boolean(existingForDevice?.dues_verified_manual);
-  const duesOk = isCheckinEligibleToVote(name, manualCarriesOver);
-
-  return NextResponse.json({
-    ok: true,
-    roster_auto_match: rosterMatch,
-    dues_ok: duesOk,
-  });
 }
 
-/** GET — Admin: list check-ins (name + timestamps only; not vote choices). */
-export async function GET(req) {
-  if (!isAdminRequest(req, null)) {
+/** Admin wrapper: auth + resolve election org + RLS scope. */
+async function withAdminElection(req, body, fn) {
+  if (!isAdminRequest(req, body)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
-  const supabase = getAdmin();
-  const { data, error } = await supabase
-    .from("voter_checkins")
-    .select("display_name, created_at, updated_at, device_hash, dues_verified_manual")
-    .order("display_name", { ascending: true });
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  const electionId =
+    (body && typeof body.election_id === "string" && body.election_id.trim()) ||
+    new URL(req.url).searchParams.get("election_id") ||
+    "";
+  if (!isUuid(electionId)) {
+    return NextResponse.json({ error: "election_id required" }, { status: 400 });
   }
-
-  const rows = data || [];
-  const nameKeyCounts = new Map();
-  for (const row of rows) {
-    const k = canonicalDuesKey(row.display_name);
-    if (!k) continue;
-    nameKeyCounts.set(k, (nameKeyCounts.get(k) || 0) + 1);
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+  try {
+    return await withOrg(orgId, (db) => fn(db, electionId));
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-
-  const checkins = rows.map((row) => {
-    const rosterAutoMatch = isDuesPayingMember(row.display_name);
-    const k = canonicalDuesKey(row.display_name);
-    return {
-      ...row,
-      roster_auto_match: rosterAutoMatch,
-      dues_ok: isCheckinEligibleToVote(row.display_name, row.dues_verified_manual),
-      name_duplicate: Boolean(k && (nameKeyCounts.get(k) || 0) > 1),
-    };
-  });
-
-  return NextResponse.json({ checkins });
 }
 
-/** PATCH — Admin: confirm dues-paid despite roster mismatch (clears flag in UI). */
+/** GET — admin: list check-ins for an election. */
+export async function GET(req) {
+  return withAdminElection(req, null, async (db, electionId) => {
+    const { rows } = await db.query(
+      `SELECT device_hash, display_name, verified, created_at, updated_at
+         FROM checkins WHERE election_id=$1 ORDER BY lower(display_name)`,
+      [electionId]
+    );
+    const keyCounts = new Map();
+    for (const r of rows) {
+      const k = nameKey(r.display_name);
+      keyCounts.set(k, (keyCounts.get(k) || 0) + 1);
+    }
+    const checkins = rows.map((r) => ({
+      ...r,
+      name_duplicate: (keyCounts.get(nameKey(r.display_name)) || 0) > 1,
+    }));
+    return NextResponse.json({ checkins });
+  });
+}
+
+/** PATCH — admin: verify a voter (e.g. manual eligibility confirmation). */
 export async function PATCH(req) {
   let body;
   try {
@@ -170,45 +147,24 @@ export async function PATCH(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  if (!isAdminRequest(req, body)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
-  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
-    return NextResponse.json({ error: "device_hash required" }, { status: 400 });
-  }
-
-  if (!body?.verify_dues) {
-    return NextResponse.json({ error: "verify_dues required" }, { status: 400 });
-  }
-
-  const supabase = getAdmin();
-  const now = new Date().toISOString();
-  const { data: updatedRows, error } = await supabase
-    .from("voter_checkins")
-    .update({ dues_verified_manual: true, updated_at: now })
-    .eq("device_hash", deviceHash)
-    .select("device_hash");
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
-  }
-
-  if (!updatedRows?.length) {
-    return NextResponse.json({ error: "No check-in found for this device" }, { status: 404 });
-  }
-
-  await supabase.channel("election_room").send({
-    type: "broadcast",
-    event: "dues_verified",
-    payload: { device_hash: deviceHash },
+  return withAdminElection(req, body, async (db, electionId) => {
+    const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
+    if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
+      return NextResponse.json({ error: "device_hash required" }, { status: 400 });
+    }
+    const { rowCount } = await db.query(
+      "UPDATE checkins SET verified=true, updated_at=now() WHERE election_id=$1 AND device_hash=$2",
+      [electionId, deviceHash]
+    );
+    if (!rowCount) {
+      return NextResponse.json({ error: "No check-in found for this device" }, { status: 404 });
+    }
+    await emit(db, electionId, "checkin_verified", { device_hash: deviceHash });
+    return NextResponse.json({ ok: true });
   });
-
-  return NextResponse.json({ ok: true });
 }
 
-/** DELETE — Admin: remove a check-in row (e.g. no dues or policy violation). */
+/** DELETE — admin: remove a check-in. */
 export async function DELETE(req) {
   let body;
   try {
@@ -216,33 +172,16 @@ export async function DELETE(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  if (!isAdminRequest(req, body)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
-  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
-    return NextResponse.json({ error: "device_hash required" }, { status: 400 });
-  }
-
-  const supabase = getAdmin();
-  const { data: deletedRows, error } = await supabase
-    .from("voter_checkins")
-    .delete()
-    .eq("device_hash", deviceHash)
-    .select("device_hash");
-
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
-  }
-
-  if (deletedRows?.length) {
-    await supabase.channel("election_room").send({
-      type: "broadcast",
-      event: "checkin_revoked",
-      payload: { device_hash: deviceHash },
-    });
-  }
-
-  return NextResponse.json({ ok: true });
+  return withAdminElection(req, body, async (db, electionId) => {
+    const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
+    if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
+      return NextResponse.json({ error: "device_hash required" }, { status: 400 });
+    }
+    const { rowCount } = await db.query(
+      "DELETE FROM checkins WHERE election_id=$1 AND device_hash=$2",
+      [electionId, deviceHash]
+    );
+    if (rowCount) await emit(db, electionId, "checkin_revoked", { device_hash: deviceHash });
+    return NextResponse.json({ ok: true });
+  });
 }
