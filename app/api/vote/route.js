@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { isAdminRequest } from "../../../lib/admin-session";
 import { rateLimit } from "../../../lib/rate-limit";
 import { withOrg } from "../../../lib/db";
+import { authorizeElection } from "../../../lib/auth";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
 
 /**
@@ -130,20 +130,17 @@ export async function POST(req) {
 
 /** GET /api/vote?election_id=&position_id= — admin: live counts per candidate. */
 export async function GET(req) {
-  if (!isAdminRequest(req, null)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
   const { searchParams } = new URL(req.url);
   const electionId = searchParams.get("election_id") || "";
   const positionId = searchParams.get("position_id") || "";
   if (!isUuid(electionId) || !isUuid(positionId)) {
     return NextResponse.json({ error: "election_id and position_id required" }, { status: 400 });
   }
-  const orgId = await resolveElectionOrg(electionId);
-  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+  const auth = await authorizeElection(req, electionId);
+  if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   try {
-    const { counts, total } = await withOrg(orgId, async (db) => {
+    const { counts, total } = await withOrg(auth.orgId, async (db) => {
       const { rows } = await db.query(
         "SELECT candidate_id, count(*)::int AS n FROM votes WHERE position_id=$1 GROUP BY candidate_id",
         [positionId]

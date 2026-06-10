@@ -17,25 +17,30 @@ function resolveTarget() {
   return { org, election };
 }
 
-/* ── Admin login ── */
-function AdminLogin({ onLogin }) {
+/* ── Auth screen: log in or create an account ── */
+function AuthScreen({ onAuthed }) {
+  const [mode, setMode] = useState("login"); // 'login' | 'signup'
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  async function handleLogin() {
+  async function submit() {
     setBusy(true);
     setError("");
     try {
-      const res = await fetch("/api/state", {
+      const path = mode === "login" ? "/api/auth/login" : "/api/auth/signup";
+      const body = mode === "login" ? { email, password } : { email, password, name };
+      const res = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ action: "auth", password }),
+        body: JSON.stringify(body),
       });
-      if (res.ok) onLogin();
-      else if (res.status === 429) setError("Too many attempts. Try again in a moment.");
-      else setError("Invalid password.");
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) onAuthed();
+      else setError(data.error || "Something went wrong.");
     } catch {
       setError("Network error. Check your connection.");
     } finally {
@@ -46,30 +51,227 @@ function AdminLogin({ onLogin }) {
   return (
     <div className="min-h-dvh flex flex-col items-center justify-center px-6 bg-uga-gray">
       <div className="w-full max-w-sm">
-        <h1 className="font-display font-black text-2xl text-center mb-6">Admin Dashboard</h1>
+        <h1 className="font-display font-black text-2xl text-center mb-1">
+          {mode === "login" ? "Welcome back" : "Create your account"}
+        </h1>
+        <p className="text-center text-sm text-uga-gray-mid mb-6">
+          {mode === "login" ? "Sign in to run your elections." : "Start running live elections in minutes."}
+        </p>
+        {mode === "signup" && (
+          <input
+            type="text"
+            placeholder="Your name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 bg-white focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
+          />
+        )}
+        <input
+          type="email"
+          placeholder="Email"
+          autoComplete="email"
+          value={email}
+          onChange={(e) => {
+            setEmail(e.target.value);
+            setError("");
+          }}
+          className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 bg-white focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
+          autoFocus
+        />
         <input
           type="password"
-          placeholder="Admin Password"
+          placeholder={mode === "login" ? "Password" : "Password (min 8 characters)"}
           value={password}
           onChange={(e) => {
             setPassword(e.target.value);
             setError("");
           }}
-          onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-          className="w-full h-14 px-4 rounded-xl border-2 border-gray-200 bg-white text-lg
-                     focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
-          autoFocus
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          className="w-full h-12 px-4 rounded-xl border-2 border-gray-200 bg-white focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
         />
         {error && <p className="text-uga-red text-sm mt-2 font-medium">{error}</p>}
         <button
-          onClick={handleLogin}
-          disabled={!password || busy}
-          className="w-full mt-4 h-14 rounded-xl bg-uga-red text-white font-bold text-lg
-                     enabled:hover:bg-uga-red-dark disabled:opacity-40 transition-all"
+          onClick={submit}
+          disabled={!email || !password || busy}
+          className="w-full mt-4 h-12 rounded-xl bg-uga-red text-white font-bold text-lg enabled:hover:bg-uga-red-dark disabled:opacity-40 transition-all"
         >
-          {busy ? "Signing in…" : "Log In"}
+          {busy ? "Please wait…" : mode === "login" ? "Log In" : "Sign Up"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setMode(mode === "login" ? "signup" : "login");
+            setError("");
+          }}
+          className="w-full mt-3 text-sm text-uga-gray-mid hover:text-uga-black font-medium"
+        >
+          {mode === "login" ? "No account? Sign up" : "Already have an account? Log in"}
         </button>
       </div>
+    </div>
+  );
+}
+
+/* ── Onboarding: create an organization ── */
+function CreateOrg({ onCreated }) {
+  const [name, setName] = useState("");
+  const [slug, setSlug] = useState("");
+  const [type, setType] = useState("club");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  function slugify(v) {
+    return v.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  }
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/orgs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name, slug: slug || slugify(name), type }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) onCreated(data.org);
+      else setError(data.error || "Could not create organization.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-md mx-auto bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+      <h2 className="font-display font-black text-xl text-uga-black mb-1">Create your organization</h2>
+      <p className="text-sm text-uga-gray-mid mb-5">This is the home for your elections.</p>
+      <label className="block text-sm font-semibold text-uga-black mb-1">Name</label>
+      <input
+        value={name}
+        onChange={(e) => {
+          setName(e.target.value);
+          setSlug(slugify(e.target.value));
+          setError("");
+        }}
+        placeholder="Acme Student Council"
+        className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
+      />
+      <label className="block text-sm font-semibold text-uga-black mb-1">URL slug</label>
+      <input
+        value={slug}
+        onChange={(e) => setSlug(slugify(e.target.value))}
+        placeholder="acme-council"
+        className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red focus:ring-2 focus:ring-uga-red/20 font-mono text-sm"
+      />
+      <label className="block text-sm font-semibold text-uga-black mb-1">Type</label>
+      <select
+        value={type}
+        onChange={(e) => setType(e.target.value)}
+        className="w-full h-12 px-4 mb-4 rounded-xl border-2 border-gray-200 focus:border-uga-red bg-white font-semibold"
+      >
+        <option value="club">Organization / club</option>
+        <option value="college">College / university</option>
+        <option value="individual">Individual</option>
+      </select>
+      {error && <p className="text-uga-red text-sm mb-3 font-medium">{error}</p>}
+      <button
+        onClick={submit}
+        disabled={!name || busy}
+        className="w-full h-12 rounded-xl bg-uga-red text-white font-bold enabled:hover:bg-uga-red-dark disabled:opacity-40 transition-all"
+      >
+        {busy ? "Creating…" : "Create organization"}
+      </button>
+    </div>
+  );
+}
+
+/* ── Onboarding: create an election ── */
+function CreateElection({ orgSlug, onCreated }) {
+  const [title, setTitle] = useState("");
+  const [slug, setSlug] = useState("");
+  const [eligibility, setEligibility] = useState("pin");
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  function slugify(v) {
+    return v.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+  }
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/elections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          org_slug: orgSlug,
+          title,
+          slug: slug || slugify(title),
+          eligibility_mode: eligibility,
+          pin: eligibility === "pin" ? pin : null,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) onCreated(data.election);
+      else setError(data.error || "Could not create election.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-md mx-auto bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+      <h2 className="font-display font-black text-xl text-uga-black mb-1">Create an election</h2>
+      <p className="text-sm text-uga-gray-mid mb-5">You can add positions and candidates next.</p>
+      <label className="block text-sm font-semibold text-uga-black mb-1">Title</label>
+      <input
+        value={title}
+        onChange={(e) => {
+          setTitle(e.target.value);
+          setSlug(slugify(e.target.value));
+          setError("");
+        }}
+        placeholder="Spring 2026 Board Election"
+        className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red focus:ring-2 focus:ring-uga-red/20"
+      />
+      <label className="block text-sm font-semibold text-uga-black mb-1">URL slug</label>
+      <input
+        value={slug}
+        onChange={(e) => setSlug(slugify(e.target.value))}
+        placeholder="spring-2026"
+        className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red font-mono text-sm"
+      />
+      <label className="block text-sm font-semibold text-uga-black mb-1">Voter eligibility</label>
+      <select
+        value={eligibility}
+        onChange={(e) => setEligibility(e.target.value)}
+        className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red bg-white font-semibold"
+      >
+        <option value="pin">Room PIN</option>
+        <option value="open">Open (anyone with the link)</option>
+        <option value="roster_csv">Roster (verify each voter)</option>
+      </select>
+      {eligibility === "pin" && (
+        <input
+          value={pin}
+          onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 8))}
+          placeholder="Room PIN (digits)"
+          inputMode="numeric"
+          className="w-full h-12 px-4 mb-3 rounded-xl border-2 border-gray-200 focus:border-uga-red text-center tracking-widest font-bold"
+        />
+      )}
+      {error && <p className="text-uga-red text-sm mb-3 font-medium">{error}</p>}
+      <button
+        onClick={submit}
+        disabled={!title || (eligibility === "pin" && pin.length < 4) || busy}
+        className="w-full h-12 rounded-xl bg-uga-red text-white font-bold enabled:hover:bg-uga-red-dark disabled:opacity-40 transition-all"
+      >
+        {busy ? "Creating…" : "Create election"}
+      </button>
     </div>
   );
 }
@@ -207,8 +409,7 @@ function AdminCountdown({ expiresAt }) {
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    DASHBOARD
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-function Dashboard({ onSessionExpired }) {
-  const [target] = useState(resolveTarget);
+function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
   const [org, setOrg] = useState(null);
   const [election, setElection] = useState(null); // { id, title, status, active_position_id, poll_expires_at, eligibility_mode }
   const [positions, setPositions] = useState([]);
@@ -244,7 +445,7 @@ function Dashboard({ onSessionExpired }) {
   /* ── Election + positions (public read) ── */
   const fetchElection = useCallback(async () => {
     const res = await fetch(
-      `/api/election?org=${encodeURIComponent(target.org)}&election=${encodeURIComponent(target.election)}`
+      `/api/election?org=${encodeURIComponent(orgSlug)}&election=${encodeURIComponent(electionSlug)}`
     );
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -256,7 +457,7 @@ function Dashboard({ onSessionExpired }) {
     setElection(json.election);
     setPositions(json.positions || []);
     return json.election;
-  }, [target]);
+  }, [orgSlug, electionSlug]);
 
   /* ── Candidates for a position (admin → includes inactive) ── */
   const fetchCandidates = useCallback(
@@ -1092,46 +1293,164 @@ function Dashboard({ onSessionExpired }) {
   );
 }
 
-/* ── Admin page entry ── */
-export default function AdminPage() {
-  const [authed, setAuthed] = useState(null); // null = probing, false/true
+/* ── Workspace: pick an org + election (or onboard), then render the dashboard ── */
+function Workspace({ me, reloadMe, onLogout }) {
+  const orgs = me.orgs || [];
+  const target = useMemo(resolveTarget, []);
+
+  const initialOrg = orgs.find((o) => o.slug === target.org)?.slug || orgs[0]?.slug || "";
+  const [orgSlug, setOrgSlug] = useState(initialOrg);
+  const [elections, setElections] = useState(null); // null = loading
+  const [electionSlug, setElectionSlug] = useState("");
+  const [creatingElection, setCreatingElection] = useState(false);
+
+  const loadElections = useCallback(async (slug) => {
+    if (!slug) return;
+    setElections(null);
+    const res = await fetch(`/api/elections?org=${encodeURIComponent(slug)}`, { credentials: "include" });
+    const data = await res.json().catch(() => ({}));
+    const list = data.elections || [];
+    setElections(list);
+    setElectionSlug((prev) => {
+      if (prev && list.some((e) => e.slug === prev)) return prev;
+      if (list.some((e) => e.slug === target.election)) return target.election;
+      return list[0]?.slug || "";
+    });
+    setCreatingElection(list.length === 0);
+  }, [target.election]);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/admin/session", { credentials: "include" });
-        if (!cancelled) setAuthed(res.ok);
-      } catch {
-        if (!cancelled) setAuthed(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    if (orgSlug) loadElections(orgSlug);
+  }, [orgSlug, loadElections]);
+
+  if (orgs.length === 0) {
+    return (
+      <div className="min-h-dvh bg-uga-gray py-10 px-4">
+        <TopBar me={me} onLogout={onLogout} />
+        <CreateOrg
+          onCreated={async (org) => {
+            await reloadMe();
+            setOrgSlug(org.slug);
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-dvh bg-uga-gray">
+      <TopBar
+        me={me}
+        onLogout={onLogout}
+        orgs={orgs}
+        orgSlug={orgSlug}
+        onOrgChange={setOrgSlug}
+        elections={elections || []}
+        electionSlug={electionSlug}
+        onElectionChange={(v) => {
+          if (v === "__new__") setCreatingElection(true);
+          else {
+            setCreatingElection(false);
+            setElectionSlug(v);
+          }
+        }}
+      />
+      {creatingElection || (elections && elections.length === 0) ? (
+        <div className="py-10 px-4">
+          <CreateElection
+            orgSlug={orgSlug}
+            onCreated={async (el) => {
+              setCreatingElection(false);
+              await loadElections(orgSlug);
+              setElectionSlug(el.slug);
+            }}
+          />
+        </div>
+      ) : elections === null ? (
+        <div className="py-20 text-center text-sm text-uga-gray-mid">Loading…</div>
+      ) : electionSlug ? (
+        <Dashboard key={`${orgSlug}/${electionSlug}`} orgSlug={orgSlug} electionSlug={electionSlug} onSessionExpired={onLogout} />
+      ) : null}
+    </div>
+  );
+}
+
+function TopBar({ me, onLogout, orgs, orgSlug, onOrgChange, elections, electionSlug, onElectionChange }) {
+  return (
+    <header className="bg-white border-b border-gray-100 px-4 py-2.5">
+      <div className="max-w-3xl mx-auto flex flex-wrap items-center gap-2 justify-between">
+        <div className="flex items-center gap-2 flex-wrap">
+          {orgs && orgs.length > 0 && (
+            <select
+              value={orgSlug}
+              onChange={(e) => onOrgChange(e.target.value)}
+              className="h-9 px-2 rounded-lg border border-gray-200 bg-white text-sm font-semibold"
+              aria-label="Organization"
+            >
+              {orgs.map((o) => (
+                <option key={o.id} value={o.slug}>{o.name}</option>
+              ))}
+            </select>
+          )}
+          {elections && (
+            <select
+              value={electionSlug || ""}
+              onChange={(e) => onElectionChange(e.target.value)}
+              className="h-9 px-2 rounded-lg border border-gray-200 bg-white text-sm font-semibold"
+              aria-label="Election"
+            >
+              {elections.map((e) => (
+                <option key={e.id} value={e.slug}>{e.title}</option>
+              ))}
+              <option value="__new__">＋ New election…</option>
+            </select>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-uga-gray-mid truncate max-w-[160px]">{me.user.email}</span>
+          <button onClick={onLogout} className="text-xs font-bold text-uga-red px-2.5 py-1 rounded-lg border border-uga-red/30 hover:bg-red-50 transition-colors">
+            Log out
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* ── Admin page entry ── */
+export default function AdminPage() {
+  const [me, setMe] = useState(undefined); // undefined = loading, {user:null} = logged out, {user,orgs} = in
+
+  const reloadMe = useCallback(async () => {
+    try {
+      const res = await fetch("/api/auth/me", { credentials: "include" });
+      const data = await res.json().catch(() => ({ user: null }));
+      setMe(data);
+    } catch {
+      setMe({ user: null });
+    }
   }, []);
 
-  const handleSessionExpired = useCallback(async () => {
+  useEffect(() => {
+    reloadMe();
+  }, [reloadMe]);
+
+  const onLogout = useCallback(async () => {
     try {
-      await fetch("/api/state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ action: "logout" }),
-      });
+      await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
     } catch {
       /* cookie expires on its own */
     }
-    setAuthed(false);
+    setMe({ user: null });
   }, []);
 
-  if (authed === null) {
+  if (me === undefined) {
     return (
       <div className="min-h-dvh flex items-center justify-center bg-uga-gray">
         <p className="text-sm text-uga-gray-mid">Loading…</p>
       </div>
     );
   }
-  if (!authed) return <AdminLogin onLogin={() => setAuthed(true)} />;
-  return <Dashboard onSessionExpired={handleSessionExpired} />;
+  if (!me.user) return <AuthScreen onAuthed={reloadMe} />;
+  return <Workspace me={me} reloadMe={reloadMe} onLogout={onLogout} />;
 }
