@@ -1,18 +1,11 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import { isCheckinEligibleToVote } from "../../../../lib/dues-roster";
-
-function getAdmin() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    { auth: { persistSession: false } }
-  );
-}
+import { withOrg } from "../../../../lib/db";
+import { resolveElectionOrg, isUuid } from "../../../../lib/api-helpers";
 
 /**
- * POST — Voter: refresh dues eligibility (device_hash acts as secret; no PIN).
- * Used after realtime reconnect / tab focus so "Confirm dues" applies without a full rejoin.
+ * POST /api/checkin/eligibility — voter refreshes their own status after a
+ * realtime reconnect / tab focus (device_hash acts as the secret; no PIN).
+ * Returns whether this device is checked in and verified for the election.
  */
 export async function POST(req) {
   let body;
@@ -22,28 +15,29 @@ export async function POST(req) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
+  const electionId = typeof body?.election_id === "string" ? body.election_id.trim() : "";
   const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
+  if (!isUuid(electionId)) {
+    return NextResponse.json({ error: "election_id required" }, { status: 400 });
+  }
   if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
     return NextResponse.json({ error: "Invalid device identifier" }, { status: 400 });
   }
 
-  const supabase = getAdmin();
-  const { data: row, error } = await supabase
-    .from("voter_checkins")
-    .select("display_name, dues_verified_manual")
-    .eq("device_hash", deviceHash)
-    .maybeSingle();
+  const orgId = await resolveElectionOrg(electionId);
+  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  try {
+    const result = await withOrg(orgId, async (db) => {
+      const { rows } = await db.query(
+        "SELECT verified FROM checkins WHERE election_id=$1 AND device_hash=$2",
+        [electionId, deviceHash]
+      );
+      return rows[0];
+    });
+    if (!result) return NextResponse.json({ checked_in: false, verified: false });
+    return NextResponse.json({ checked_in: true, verified: result.verified });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-
-  if (!row) {
-    return NextResponse.json({ checked_in: false, dues_ok: false });
-  }
-
-  return NextResponse.json({
-    checked_in: true,
-    dues_ok: isCheckinEligibleToVote(row.display_name, row.dues_verified_manual),
-  });
 }

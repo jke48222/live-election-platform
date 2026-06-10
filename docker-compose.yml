@@ -1,0 +1,27 @@
+# Local self-hosted Postgres for development.
+# (The full self-host stack — app + realtime gateway + Caddy TLS + MinIO —
+#  is assembled in Phase 8. This is just the database for Phase 1.)
+#
+#   docker compose up -d
+#   DATABASE_URL=postgres://postgres:postgres@localhost:5432/elections \
+#     node --env-file=.env.local db/migrate.mjs
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: elections
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d elections"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
