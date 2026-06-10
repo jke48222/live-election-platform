@@ -436,6 +436,12 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
   const [checkinRemovingHash, setCheckinRemovingHash] = useState(null);
   const [checkinVerifyingHash, setCheckinVerifyingHash] = useState(null);
 
+  // Ballot builder
+  const [builderPositions, setBuilderPositions] = useState([]);
+  const [builderLoading, setBuilderLoading] = useState(false);
+  const [newPositionTitle, setNewPositionTitle] = useState("");
+  const [newCandidateByPos, setNewCandidateByPos] = useState({});
+
   const pollInterval = useRef(null);
   const jsonHeaders = { "Content-Type": "application/json" };
   const fetchOpts = { credentials: "include" };
@@ -885,9 +891,77 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
     await loadHistoryPosition(historyPositionId || "");
   }
 
+  /* ── Ballot builder ── */
+  const fetchBuilder = useCallback(async () => {
+    if (!electionId) return;
+    setBuilderLoading(true);
+    try {
+      const res = await fetch(`/api/positions?election_id=${electionId}`, fetchOpts);
+      if (res.status === 401) return onSessionExpired();
+      const data = await res.json().catch(() => ({}));
+      setBuilderPositions(data.positions || []);
+    } finally {
+      setBuilderLoading(false);
+    }
+  }, [electionId, onSessionExpired]);
+
+  async function builderApi(method, path, payload) {
+    const res = await fetch(path, { method, headers: jsonHeaders, credentials: "include", body: JSON.stringify(payload) });
+    if (res.status === 401) { onSessionExpired(); return null; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { alert(data.error || "Action failed"); return null; }
+    return data;
+  }
+
+  async function addPosition() {
+    const title = newPositionTitle.trim();
+    if (!title) return;
+    if (await builderApi("POST", "/api/positions", { election_id: electionId, title })) {
+      setNewPositionTitle("");
+      await fetchBuilder();
+      await fetchElection();
+    }
+  }
+  async function renamePosition(id, title) {
+    const next = (title || "").trim();
+    if (!next) return;
+    if (await builderApi("PATCH", "/api/positions", { election_id: electionId, id, title: next })) {
+      await fetchBuilder();
+      await fetchElection();
+    }
+  }
+  async function movePosition(id, move) {
+    if (await builderApi("PATCH", "/api/positions", { election_id: electionId, id, move })) {
+      await fetchBuilder();
+      await fetchElection();
+    }
+  }
+  async function deletePosition(id, title) {
+    if (!confirm(`Delete position "${title}" and all its candidates?`)) return;
+    if (await builderApi("DELETE", "/api/positions", { election_id: electionId, id })) {
+      await fetchBuilder();
+      await fetchElection();
+    }
+  }
+  async function addBuilderCandidate(positionId) {
+    const name = (newCandidateByPos[positionId] || "").trim();
+    if (!name) return;
+    if (await builderApi("POST", "/api/candidates", { election_id: electionId, position_id: positionId, name })) {
+      setNewCandidateByPos((m) => ({ ...m, [positionId]: "" }));
+      await fetchBuilder();
+    }
+  }
+  async function deleteBuilderCandidate(id, name) {
+    if (!confirm(`Remove candidate "${name}"?`)) return;
+    if (await builderApi("DELETE", "/api/candidates", { election_id: electionId, id })) {
+      await fetchBuilder();
+    }
+  }
+
   /* ═══════════ RENDER ═══════════ */
   const status = election?.status || "waiting";
   const currentPosition = getCurrentPosition();
+  const voterPath = `/${orgSlug}/${electionSlug}`;
   const canResetPolls = status === "waiting" && !election?.active_position_id;
   const selectedLaunchPosition = selectedLaunchPositionId
     ? positions.find((p) => p.id === selectedLaunchPositionId)
@@ -898,6 +972,11 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
     if (status !== "waiting" || !selectedLaunchPositionId) return;
     fetchCandidates(selectedLaunchPositionId);
   }, [status, selectedLaunchPositionId, fetchCandidates]);
+
+  /* Load the ballot builder while the election is idle. */
+  useEffect(() => {
+    if (status === "waiting" || status === "draft") fetchBuilder();
+  }, [status, fetchBuilder]);
 
   const maxVotes = Math.max(...Object.values(voteCounts), 0);
   const leaders = Object.entries(voteCounts).filter(([, c]) => c === maxVotes && maxVotes > 0).map(([id]) => id);
@@ -948,8 +1027,7 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
           <h2 className="text-sm font-bold text-uga-gray-mid uppercase tracking-wider mb-3">Election Progress</h2>
           {positions.length === 0 ? (
             <p className="text-sm text-uga-gray-mid">
-              This election has no positions yet. Add them via the builder (coming in Phase 4) or
-              <code className="text-xs bg-gray-100 px-1 rounded mx-1">npm run db:seed</code> for demo data.
+              No positions yet — add them in <strong>Ballot setup</strong> below.
             </p>
           ) : (
             <div className="flex flex-wrap gap-2">
@@ -970,6 +1048,91 @@ function Dashboard({ orgSlug, electionSlug, onSessionExpired }) {
             </div>
           )}
         </section>
+
+        {/* Voter link */}
+        <section className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+          <h2 className="text-sm font-bold text-uga-gray-mid uppercase tracking-wider mb-2">Voter link</h2>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 text-sm bg-gray-50 border border-gray-100 rounded-lg px-3 py-2 truncate">
+              {voterPath}
+            </code>
+            <a
+              href={voterPath}
+              target="_blank"
+              rel="noreferrer"
+              className="text-xs font-bold text-uga-red px-3 py-2 rounded-lg border border-uga-red/30 hover:bg-red-50 transition-colors shrink-0"
+            >
+              Open
+            </a>
+          </div>
+        </section>
+
+        {/* Ballot setup (builder) — while idle */}
+        {(status === "waiting" || status === "draft") && (
+          <section className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-display font-black text-lg text-uga-black">Ballot setup</h2>
+              {builderLoading && <span className="text-xs text-uga-gray-mid">Saving…</span>}
+            </div>
+            {builderPositions.length === 0 && (
+              <p className="text-sm text-uga-gray-mid mb-3">
+                Add the positions voters will choose for, then add candidates to each.
+              </p>
+            )}
+            <div className="space-y-4">
+              {builderPositions.map((p, idx) => (
+                <div key={p.id} className="rounded-xl border border-gray-100 p-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <input
+                      defaultValue={p.title}
+                      onBlur={(e) => {
+                        const v = e.target.value.trim();
+                        if (v && v !== p.title) renamePosition(p.id, v);
+                      }}
+                      className="flex-1 h-9 px-2 rounded-lg border border-gray-200 font-bold text-uga-black focus:border-uga-red"
+                      aria-label="Position title"
+                    />
+                    <button onClick={() => movePosition(p.id, "up")} disabled={idx === 0} className="h-9 w-9 rounded-lg border border-gray-200 text-uga-black disabled:opacity-30" aria-label="Move up">↑</button>
+                    <button onClick={() => movePosition(p.id, "down")} disabled={idx === builderPositions.length - 1} className="h-9 w-9 rounded-lg border border-gray-200 text-uga-black disabled:opacity-30" aria-label="Move down">↓</button>
+                    <button onClick={() => deletePosition(p.id, p.title)} className="text-xs font-bold text-uga-red px-2 py-2 rounded-lg border border-uga-red/30 hover:bg-red-50">Delete</button>
+                  </div>
+                  <div className="space-y-1 mb-2 pl-1">
+                    {p.candidates.map((c) => (
+                      <div key={c.id} className="flex items-center justify-between gap-2 text-sm">
+                        <span className="truncate text-uga-black">
+                          {c.name}
+                          {!c.is_active && <span className="text-gray-400"> (inactive)</span>}
+                        </span>
+                        <button onClick={() => deleteBuilderCandidate(c.id, c.name)} className="text-xs font-bold text-uga-red px-2 py-0.5 rounded hover:bg-red-50 shrink-0">Remove</button>
+                      </div>
+                    ))}
+                    {p.candidates.length === 0 && <p className="text-xs text-uga-gray-mid">No candidates yet.</p>}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      value={newCandidateByPos[p.id] || ""}
+                      onChange={(e) => setNewCandidateByPos((m) => ({ ...m, [p.id]: e.target.value }))}
+                      onKeyDown={(e) => e.key === "Enter" && addBuilderCandidate(p.id)}
+                      placeholder="Add candidate…"
+                      className="flex-1 h-9 px-2 rounded-lg border border-gray-200 text-sm focus:border-uga-red"
+                    />
+                    <button onClick={() => addBuilderCandidate(p.id)} disabled={!(newCandidateByPos[p.id] || "").trim()} className="h-9 px-3 rounded-lg bg-uga-black text-white text-sm font-semibold disabled:opacity-30">Add</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2 mt-4">
+              <input
+                value={newPositionTitle}
+                onChange={(e) => setNewPositionTitle(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addPosition()}
+                placeholder="New position (e.g. President)"
+                className="flex-1 h-11 px-3 rounded-xl border-2 border-gray-200 focus:border-uga-red"
+              />
+              <button onClick={addPosition} disabled={!newPositionTitle.trim()} className="h-11 px-5 rounded-xl bg-uga-red text-white font-bold disabled:opacity-40">Add position</button>
+            </div>
+          </section>
+        )}
 
         {/* Pre-poll: launch */}
         {status === "waiting" && selectedLaunchPosition && incompletePositions.length > 0 && (

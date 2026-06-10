@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { query, withOrg } from "../../../lib/db";
-import { getSessionUser, getMembershipRole } from "../../../lib/auth";
+import { getSessionUser, getMembershipRole, authorizeElection } from "../../../lib/auth";
+import { isUuid } from "../../../lib/api-helpers";
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,48}[a-z0-9])?$/;
 const ELIGIBILITY = ["open", "pin", "roster_csv", "email_magic_link", "access_code", "sso_oidc"];
@@ -83,6 +84,61 @@ export async function POST(req) {
     });
     if (election.error) return NextResponse.json({ error: election.error }, { status: 409 });
     return NextResponse.json({ org: { slug: org.slug }, election: election.election });
+  } catch (err) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}
+
+/** PATCH /api/elections { election_id, title?, eligibility_mode?, pin? } — settings (idle only). */
+export async function PATCH(req) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+  if (!isUuid(body?.election_id)) {
+    return NextResponse.json({ error: "election_id required" }, { status: 400 });
+  }
+  const auth = await authorizeElection(req, body.election_id);
+  if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  try {
+    const result = await withOrg(auth.orgId, async (db) => {
+      const { rows: eRows } = await db.query(
+        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        [body.election_id]
+      );
+      if (!eRows[0]) return { error: "Election not found", status: 404 };
+      if (eRows[0].status === "voting" || eRows[0].active_position_id) {
+        return { error: "Finish the current poll before changing settings.", status: 409 };
+      }
+      const fields = [];
+      const params = [];
+      if (typeof body.title === "string" && body.title.trim()) {
+        params.push(body.title.trim());
+        fields.push(`title = $${params.length}`);
+      }
+      if (ELIGIBILITY.includes(body.eligibility_mode)) {
+        params.push(body.eligibility_mode);
+        fields.push(`eligibility_mode = $${params.length}`);
+      }
+      if (typeof body.pin === "string") {
+        params.push(body.pin.trim() || null);
+        fields.push(`pin = $${params.length}`);
+      }
+      if (fields.length === 0) return { error: "Nothing to update", status: 400 };
+      params.push(body.election_id);
+      const { rows } = await db.query(
+        `UPDATE elections SET ${fields.join(", ")}, updated_at = now()
+          WHERE id = $${params.length}
+          RETURNING id, slug, title, status, mode, eligibility_mode, pin`,
+        params
+      );
+      return { election: rows[0] };
+    });
+    if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
+    return NextResponse.json(result);
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }

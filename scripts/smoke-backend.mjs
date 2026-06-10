@@ -47,6 +47,8 @@ async function main() {
     `candidates for "${positions[0].title}" returned (${cands.json.candidates?.length})`);
   const candidateId = cands.json.candidates[0].id;
 
+  // Robust reset to a clean waiting state (handles a stuck voting/locked run).
+  await api("/api/state", { method: "POST", auth: true, body: { action: "finalize", election_id: electionId } });
   await api("/api/state", { method: "POST", auth: true, body: { action: "reset_all_results", election_id: electionId } });
 
   const launch = await api("/api/state", { method: "POST", auth: true,

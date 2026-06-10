@@ -174,11 +174,11 @@ export async function POST(req) {
         return NextResponse.json({ ok: true });
       }
 
-      // ── RESET the whole election (F17: not mid-poll) ──
+      // ── RESET the whole election (F17: not while actively voting) ──
       if (action === "reset_all_results") {
-        if (election.status !== "waiting" || election.active_position_id) {
+        if (election.status === "voting" || election.active_position_id) {
           return NextResponse.json(
-            { error: "Finish the current poll before resetting the entire election." },
+            { error: "Finish or lock the current poll before resetting the entire election." },
             { status: 409 }
           );
         }
