@@ -12,20 +12,25 @@ import { WebSocket } from "ws";
 
 const BASE = process.env.BASE_URL || "http://localhost:3000";
 const RT = process.env.REALTIME_TEST_URL || "ws://localhost:3001";
-const ADMIN = process.env.ADMIN_PASSWORD || "testpass";
+const EMAIL = process.env.DEMO_EMAIL || "demo@example.com";
+const PASSWORD = process.env.DEMO_PASSWORD || "demodemo123";
 
 let failures = 0;
+let cookie = "";
 const ok = (c, m) => (c ? console.log(`  ✓ ${m}`) : (console.log(`  ✗ ${m}`), failures++));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function api(path, { method = "GET", body, admin = false } = {}) {
   const headers = { "Content-Type": "application/json" };
-  if (admin) headers["x-admin-password"] = ADMIN;
+  if (admin && cookie) headers["Cookie"] = cookie;
   const res = await fetch(`${BASE}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const setCookie = res.headers.get("set-cookie");
+  if (setCookie && setCookie.includes("ev_session=")) cookie = setCookie.split(";")[0];
   return { status: res.status, json: await res.json().catch(() => null) };
 }
 
 async function main() {
+  await api("/api/auth/login", { method: "POST", body: { email: EMAIL, password: PASSWORD } });
   const read = await api("/api/election?org=demo&election=spring-2026");
   const electionId = read.json?.election?.id;
   const positionId = read.json?.positions?.[0]?.id;

@@ -10,7 +10,10 @@
     "db:seed": "node --env-file=.env.local db/seed.mjs",
     "db:verify": "node --env-file=.env.local db/verify-rls.mjs",
     "realtime": "node --env-file=.env.local services/realtime/server.mjs",
-    "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs"
+    "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs",
+    "smoke:backend": "node scripts/smoke-backend.mjs",
+    "smoke:auth": "node scripts/smoke-auth.mjs",
+    "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs"
   },
   "dependencies": {
     "next": "^14.2.15",

@@ -1,19 +1,15 @@
 import { NextResponse } from "next/server";
-import {
-  adminCookieHeader,
-  clearAdminCookieHeader,
-  isAdminRequest,
-  signAdminSession,
-} from "../../../lib/admin-session";
-import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
 import { withOrg } from "../../../lib/db";
 import { emit } from "../../../lib/realtime";
-import { resolveElectionOrg, isUuid, clampDuration } from "../../../lib/api-helpers";
+import { authorizeElection } from "../../../lib/auth";
+import { isUuid, clampDuration } from "../../../lib/api-helpers";
 
 /**
  * Election state machine — self-hosted Postgres + realtime NOTIFY.
- * Every mutating action is scoped to one election (body.election_id) and
- * runs inside withOrg() so RLS confines it to that election's organization.
+ * Authorization is per-org RBAC: the session user must hold an admin-capable
+ * membership in the election's organization. Every mutating action is scoped
+ * to that election (body.election_id) and runs inside withOrg() so RLS
+ * confines it to the org.
  */
 export async function POST(req) {
   let body;
@@ -24,46 +20,17 @@ export async function POST(req) {
   }
   const { action } = body || {};
 
-  // ── Auth: mint a signed session cookie ──
-  if (action === "auth") {
-    const ip = clientIpFromReq(req);
-    const limited = rateLimit(`admin-auth:${ip}`, 10, 60 * 1000);
-    if (!limited.ok) {
-      return NextResponse.json(
-        { error: "Too many attempts. Try again shortly." },
-        { status: 429, headers: { "Retry-After": String(limited.retryAfter) } }
-      );
-    }
-    if (body.password !== process.env.ADMIN_PASSWORD) {
-      return NextResponse.json({ error: "Invalid password" }, { status: 401 });
-    }
-    const res = NextResponse.json({ ok: true });
-    res.headers.set("Set-Cookie", adminCookieHeader(signAdminSession()));
-    return res;
-  }
-
-  if (action === "logout") {
-    const res = NextResponse.json({ ok: true });
-    res.headers.set("Set-Cookie", clearAdminCookieHeader());
-    return res;
-  }
-
-  if (!isAdminRequest(req, body)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  // All remaining actions are election-scoped.
   const electionId = typeof body.election_id === "string" ? body.election_id.trim() : "";
   if (!isUuid(electionId)) {
     return NextResponse.json({ error: "election_id required" }, { status: 400 });
   }
-  const orgId = await resolveElectionOrg(electionId);
-  if (!orgId) {
-    return NextResponse.json({ error: "Unknown election_id" }, { status: 404 });
+  const auth = await authorizeElection(req, electionId);
+  if (!auth) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   try {
-    return await withOrg(orgId, async (db) => {
+    return await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
         "SELECT id, status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
         [electionId]
