@@ -13,6 +13,7 @@
     "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs",
     "smoke:backend": "node scripts/smoke-backend.mjs",
     "smoke:auth": "node scripts/smoke-auth.mjs",
+    "smoke:builder": "node scripts/smoke-builder.mjs",
     "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs"
   },
   "dependencies": {
