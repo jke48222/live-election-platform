@@ -10,11 +10,9 @@
     "db:seed": "node --env-file=.env.local db/seed.mjs",
     "db:verify": "node --env-file=.env.local db/verify-rls.mjs",
     "realtime": "node --env-file=.env.local services/realtime/server.mjs",
-    "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs",
-    "seed:legacy": "node --env-file=.env.local lib/seed.mjs"
+    "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
     "next": "^14.2.15",
     "pg": "^8.21.0",
     "react": "^18.3.1",
