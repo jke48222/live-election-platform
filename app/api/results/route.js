@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { isAdminRequest } from "../../../lib/admin-session";
 import { withOrg } from "../../../lib/db";
-import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
+import { authorizeElection } from "../../../lib/auth";
+import { isUuid } from "../../../lib/api-helpers";
 
 /**
  * GET /api/results?election_id=[&position_id=]
@@ -56,20 +56,17 @@ async function winnerRow(db, position) {
 }
 
 export async function GET(req) {
-  if (!isAdminRequest(req, null)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
   const { searchParams } = new URL(req.url);
   const electionId = searchParams.get("election_id") || "";
   const positionId = searchParams.get("position_id");
   if (!isUuid(electionId)) {
     return NextResponse.json({ error: "election_id required" }, { status: 400 });
   }
-  const orgId = await resolveElectionOrg(electionId);
-  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+  const auth = await authorizeElection(req, electionId);
+  if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   try {
-    return await withOrg(orgId, async (db) => {
+    return await withOrg(auth.orgId, async (db) => {
       if (positionId) {
         if (!isUuid(positionId)) {
           return NextResponse.json({ error: "Invalid position_id" }, { status: 400 });

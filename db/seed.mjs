@@ -13,9 +13,12 @@
  * never seeded.
  */
 import pg from "pg";
+import { hashPassword } from "../lib/auth.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL || "postgres://localhost:5432/elections";
+
+const DEMO_USER = { email: "demo@example.com", password: "demodemo123", name: "Demo Owner" };
 
 const PLANS = [
   { key: "free_beta",  name: "Free Beta",    price_cents: 0,    interval: "none",
@@ -59,6 +62,21 @@ async function main() {
       [betaPlan.rows[0].id, JSON.stringify({ primary_color: "#2563eb", display_name: "Demo Organization" })]
     );
     const orgId = org.rows[0].id;
+
+    // Demo owner account so the demo election has an administrator.
+    const user = await c.query(
+      `INSERT INTO users (email, password_hash, name, email_verified)
+       VALUES ($1, $2, $3, true)
+       ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash
+       RETURNING id`,
+      [DEMO_USER.email, hashPassword(DEMO_USER.password), DEMO_USER.name]
+    );
+    await c.query(
+      `INSERT INTO memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')
+       ON CONFLICT (org_id, user_id) DO NOTHING`,
+      [orgId, user.rows[0].id]
+    );
+    console.log(`✓ demo owner: ${DEMO_USER.email} / ${DEMO_USER.password}`);
 
     const election = await c.query(
       `INSERT INTO elections (org_id, slug, title, description, mode, status, eligibility_mode, pin)

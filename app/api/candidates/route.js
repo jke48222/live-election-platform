@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { isAdminRequest } from "../../../lib/admin-session";
 import { withOrg } from "../../../lib/db";
+import { authorizeElection } from "../../../lib/auth";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
 
 /**
@@ -19,7 +19,7 @@ export async function GET(req) {
   const orgId = await resolveElectionOrg(electionId);
   if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
-  const admin = isAdminRequest(req, null);
+  const admin = !!(await authorizeElection(req, electionId));
   try {
     const candidates = await withOrg(orgId, async (db) => {
       const activeFilter = admin ? "" : "AND c.is_active = true";
@@ -38,19 +38,16 @@ export async function GET(req) {
   }
 }
 
-/** Admin: resolve org + run inside its RLS scope. */
+/** Admin: authorize via org membership, then run inside the org's RLS scope. */
 async function withAdminElection(req, body, fn) {
-  if (!isAdminRequest(req, body)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
   const electionId = typeof body?.election_id === "string" ? body.election_id.trim() : "";
   if (!isUuid(electionId)) {
     return NextResponse.json({ error: "election_id required" }, { status: 400 });
   }
-  const orgId = await resolveElectionOrg(electionId);
-  if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+  const auth = await authorizeElection(req, electionId);
+  if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   try {
-    return await withOrg(orgId, (db) => fn(db, electionId));
+    return await withOrg(auth.orgId, (db) => fn(db, electionId));
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
