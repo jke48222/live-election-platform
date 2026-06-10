@@ -4,17 +4,13 @@ import { withOrg } from "../../../lib/db";
 import { emit } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
+import { resolveEligibility, nameIsIdentity } from "../../../lib/eligibility";
 
 const MAX_NAME = 255;
 
 /** Normalize a display name for same-name duplicate detection. */
 function nameKey(name) {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-/** Modes where a voter must be verified before they can vote. */
-function needsVerification(mode) {
-  return mode === "roster_csv" || mode === "email_magic_link" || mode === "sso_oidc";
 }
 
 /** POST — voter registers identity for an election (PIN-gated when applicable). */
@@ -34,7 +30,7 @@ export async function POST(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  const { election_id: electionId, display_name, device_hash: deviceHash, pin } = body || {};
+  const { election_id: electionId, display_name, device_hash: deviceHash, pin, code, email } = body || {};
 
   if (!isUuid(electionId)) {
     return NextResponse.json({ error: "election_id required" }, { status: 400 });
@@ -63,20 +59,33 @@ export async function POST(req) {
         return NextResponse.json({ error: "Invalid room PIN" }, { status: 401 });
       }
 
-      // Block the same name held on a different device in this election.
-      const key = nameKey(name);
-      const { rows: dupes } = await db.query(
-        "SELECT device_hash, display_name FROM checkins WHERE election_id=$1 AND device_hash<>$2",
-        [electionId, deviceHash]
-      );
-      if (dupes.some((r) => nameKey(r.display_name) === key)) {
-        return NextResponse.json(
-          { error: "This name is already checked in on another device." },
-          { status: 409 }
+      // A duplicate display name is only a conflict when the name IS the
+      // voter's identity (pin/open/roster). For codes/emails, identity is the
+      // code/email, so two voters may legitimately share a display name.
+      if (nameIsIdentity(election.eligibility_mode)) {
+        const key = nameKey(name);
+        const { rows: dupes } = await db.query(
+          "SELECT display_name FROM checkins WHERE election_id=$1 AND device_hash<>$2",
+          [electionId, deviceHash]
         );
+        if (dupes.some((r) => nameKey(r.display_name) === key)) {
+          return NextResponse.json(
+            { error: "This name is already checked in on another device." },
+            { status: 409 }
+          );
+        }
       }
 
-      const verified = !needsVerification(election.eligibility_mode);
+      // Provider-driven eligibility (may claim a single-use access code).
+      const elig = await resolveEligibility(
+        db,
+        { id: electionId, eligibility_mode: election.eligibility_mode },
+        { displayName: name, email, code, deviceHash }
+      );
+      if (!elig.ok) {
+        return NextResponse.json({ error: elig.error, code: elig.code }, { status: 403 });
+      }
+      const verified = elig.verified;
       // Re-checking in with a new name on the same device resets verification.
       const orgExpr = "nullif(current_setting('app.current_org',true),'')::uuid";
       await db.query(

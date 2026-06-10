@@ -14,6 +14,7 @@
     "smoke:backend": "node scripts/smoke-backend.mjs",
     "smoke:auth": "node scripts/smoke-auth.mjs",
     "smoke:builder": "node scripts/smoke-builder.mjs",
+    "smoke:eligibility": "node scripts/smoke-eligibility.mjs",
     "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs"
   },
   "dependencies": {
