@@ -28,11 +28,16 @@ const VOTER_NAME_STORAGE_KEY = "ev_voter_display_name";
 function JoinScreen({ org, election, onJoin, sessionNotice = "" }) {
   const [displayName, setDisplayName] = useState("");
   const [pin, setPin] = useState("");
+  const [code, setCode] = useState("");
+  const [email, setEmail] = useState("");
   const [error, setError] = useState("");
   const [joining, setJoining] = useState(false);
   const [notice, setNotice] = useState(sessionNotice);
 
-  const needsPin = election?.eligibility_mode === "pin";
+  const mode = election?.eligibility_mode;
+  const needsPin = mode === "pin";
+  const needsCode = mode === "access_code";
+  const needsEmail = mode === "email_magic_link";
   const title = org?.name || "Live Election";
   const subtitle = election?.title || "";
   const accent = org?.branding?.primary_color || "#2563eb";
@@ -47,20 +52,22 @@ function JoinScreen({ org, election, onJoin, sessionNotice = "" }) {
     }
   }, []);
 
+  const ready =
+    displayName.trim() &&
+    (!needsPin || pin.length >= 4) &&
+    (!needsCode || code.trim()) &&
+    (!needsEmail || email.includes("@"));
+
   async function handleJoin() {
     const name = displayName.trim();
-    if (!name) {
-      setError("Please enter your name.");
-      return;
-    }
-    if (needsPin && pin.length < 4) {
-      setError("Enter the room PIN to join.");
-      return;
-    }
+    if (!name) return setError("Please enter your name.");
+    if (needsPin && pin.length < 4) return setError("Enter the room PIN to join.");
+    if (needsCode && !code.trim()) return setError("Enter your access code.");
+    if (needsEmail && !email.includes("@")) return setError("Enter the email on your invite.");
     setJoining(true);
     setError("");
     try {
-      await onJoin(name, needsPin ? pin : null);
+      await onJoin(name, { pin, code: code.trim(), email: email.trim() });
       try {
         localStorage.setItem(VOTER_NAME_STORAGE_KEY, name);
       } catch {
@@ -135,6 +142,50 @@ function JoinScreen({ org, election, onJoin, sessionNotice = "" }) {
           </>
         )}
 
+        {needsCode && (
+          <>
+            <label htmlFor="code" className="block text-sm font-semibold text-slate-900 mb-2">
+              Access code
+            </label>
+            <input
+              id="code"
+              type="text"
+              autoComplete="one-time-code"
+              placeholder="Code from your invite"
+              value={code}
+              onChange={(e) => {
+                setCode(e.target.value.toUpperCase());
+                setError("");
+              }}
+              onKeyDown={(e) => e.key === "Enter" && handleJoin()}
+              className="w-full h-12 px-4 mb-1 rounded-xl border-2 border-slate-200 bg-white text-center text-xl tracking-[0.3em] font-bold uppercase
+                         focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 transition-all"
+            />
+          </>
+        )}
+
+        {needsEmail && (
+          <>
+            <label htmlFor="email" className="block text-sm font-semibold text-slate-900 mb-2">
+              Email
+            </label>
+            <input
+              id="email"
+              type="email"
+              autoComplete="email"
+              placeholder="The email on your invite"
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                setError("");
+              }}
+              onKeyDown={(e) => e.key === "Enter" && handleJoin()}
+              className="w-full h-12 px-4 mb-1 rounded-xl border-2 border-slate-200 bg-white text-slate-900 font-medium
+                         focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 transition-all"
+            />
+          </>
+        )}
+
         {notice && (
           <p
             role="status"
@@ -151,7 +202,7 @@ function JoinScreen({ org, election, onJoin, sessionNotice = "" }) {
 
         <button
           onClick={handleJoin}
-          disabled={!displayName.trim() || (needsPin && pin.length < 4) || joining}
+          disabled={!ready || joining}
           className="w-full mt-4 h-14 rounded-xl text-white font-bold text-lg shadow-lg
                      enabled:active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed
                      transition-all duration-150"
@@ -448,7 +499,7 @@ export default function VoterApp({ orgSlug, electionSlug }) {
   }, []);
 
   /* ── Join: check-in, then connect realtime ── */
-  async function handleJoin(displayName, pin) {
+  async function handleJoin(displayName, { pin, code, email } = {}) {
     const hash = await getDeviceHash();
     const electionId = electionIdRef.current;
     if (!electionId) throw new Error("Election is still loading. Try again.");
@@ -456,7 +507,7 @@ export default function VoterApp({ orgSlug, electionSlug }) {
     const res = await fetch("/api/checkin", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ election_id: electionId, display_name: displayName, device_hash: hash, pin }),
+      body: JSON.stringify({ election_id: electionId, display_name: displayName, device_hash: hash, pin, code, email }),
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(json.error || "Check-in failed. Try again.");
