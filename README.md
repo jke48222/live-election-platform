@@ -1,5 +1,7 @@
 # Live Election Platform
 
+[![License](https://img.shields.io/github/license/jke48222/live-election-platform)](LICENSE) ![Top language](https://img.shields.io/github/languages/top/jke48222/live-election-platform) ![framework](https://img.shields.io/badge/framework-Next.js-black) ![database](https://img.shields.io/badge/database-PostgreSQL%2C%20row----level%20security-blue)
+
 A system for running a live election in a room: the host advances one race at a time from a laptop,
 everyone votes on their phones, and results appear as the votes land. This is a rewrite of a system
 built for a single student chapter, generalized so that any organization can create its own
@@ -496,6 +498,10 @@ Known gaps, in the order I would fix them:
 **Prior version.** The single-tenant application this replaces is in a separate repository,
 `nsbe-election`. It is the one that actually ran a live chapter election. It is also the one whose
 schema allows exactly one election to exist.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 
