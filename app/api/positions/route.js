@@ -4,6 +4,7 @@ import { emit } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
 import { isIdle } from "../../../lib/state-guards";
+import { parseMaxWinners } from "../../../lib/results";
 import { nameKey } from "../../_lib/poll";
 
 const DUPLICATE_TITLE = "This election already has a position with that title.";
@@ -83,7 +84,8 @@ export async function POST(req) {
   if (auth.error) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
   const title = typeof body?.title === "string" ? body.title.trim() : "";
-  const maxWinners = Math.max(1, Math.min(50, Number(body?.max_winners) || 1));
+  const maxWinners = parseMaxWinners(body?.max_winners);
+  if (maxWinners.error) return NextResponse.json({ error: maxWinners.error }, { status: 400 });
   if (!title) return NextResponse.json({ error: "Title is required." }, { status: 400 });
   if (title.length > 120) return NextResponse.json({ error: "Title too long." }, { status: 400 });
 
@@ -108,7 +110,7 @@ export async function POST(req) {
         `INSERT INTO positions (election_id, org_id, title, sort_order, max_winners)
          VALUES ($1, nullif(current_setting('app.current_org',true),'')::uuid, $2, $3, $4)
          RETURNING id, title, sort_order, max_winners, is_completed`,
-        [body.election_id, title, ord[0].next, maxWinners]
+        [body.election_id, title, ord[0].next, maxWinners.value]
       );
       // A new race reopens a completed election so it can be launched.
       if (eRows[0].status === "completed") {
@@ -187,7 +189,9 @@ export async function PATCH(req) {
         fields.push(`title = $${params.length}`);
       }
       if (body.max_winners != null) {
-        params.push(Math.max(1, Math.min(50, Number(body.max_winners) || 1)));
+        const maxWinners = parseMaxWinners(body.max_winners);
+        if (maxWinners.error) return { error: maxWinners.error, status: 400 };
+        params.push(maxWinners.value);
         fields.push(`max_winners = $${params.length}`);
       }
       if (fields.length === 0) return { error: "Nothing to update", status: 400 };

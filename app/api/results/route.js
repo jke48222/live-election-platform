@@ -2,15 +2,17 @@ import { NextResponse } from "next/server";
 import { withOrg } from "../../../lib/db";
 import { authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
+import { tallySeats } from "../../../lib/results";
 
 /**
  * GET /api/results?election_id=[&position_id=]
  *   - with position_id : winner row for that single position
  *   - without          : winner rows for every completed position
  *
- * Plurality among active candidates (preserves the original tie semantics:
- * leaders = all candidates sharing the top count). Multi-seat tallies for
- * positions with max_winners > 1 are a later refinement.
+ * The top max_winners active candidates win (lib/results.js). `names` holds
+ * the clear winners and then, when there is a tie for the last seats, every
+ * candidate on the tied count; `winners`, `tied` and `open_seats` split them.
+ * With one seat this is the original rule: the leaders on the top count.
  */
 async function winnerRow(db, position) {
   const { rows: cands } = await db.query(
@@ -37,22 +39,7 @@ async function winnerRow(db, position) {
     total_votes: total,
   };
 
-  if (cands.length === 0) {
-    return { ...base, names: [], display: "—", is_tie: false, vote_count: 0 };
-  }
-  let max = 0;
-  for (const c of cands) max = Math.max(max, counts[c.id] || 0);
-  if (max === 0) {
-    return { ...base, names: [], display: "No votes", is_tie: false, vote_count: 0 };
-  }
-  const leaders = cands.filter((c) => (counts[c.id] || 0) === max);
-  return {
-    ...base,
-    names: leaders.map((c) => c.name),
-    display: leaders.map((c) => c.name).join(" · "),
-    is_tie: leaders.length > 1,
-    vote_count: max,
-  };
+  return { ...base, ...tallySeats(cands, counts, position.max_winners) };
 }
 
 export async function GET(req) {
