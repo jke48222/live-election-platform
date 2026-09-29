@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "test": "node --test lib/tests/*.test.mjs db/tests/*.test.mjs services/realtime/test/*.test.mjs scripts/tests/*.test.mjs",
+    "test": "node --test lib/tests/*.test.mjs app/_lib/*.test.mjs db/tests/*.test.mjs services/realtime/test/*.test.mjs scripts/tests/*.test.mjs",
     "start": "next start",
     "db:migrate": "node --env-file=.env.local db/migrate.mjs",
     "db:seed": "node --env-file=.env.local db/seed.mjs",
