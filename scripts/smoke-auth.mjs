@@ -53,7 +53,7 @@ async function main() {
   const elSlug = `vote-${rnd}`;
   const el = await owner("/api/elections", {
     method: "POST",
-    body: { org_slug: orgSlug, title: "Board Vote", slug: elSlug, eligibility_mode: "pin", pin: "4242" },
+    body: { org_slug: orgSlug, title: "Board Vote", slug: elSlug, eligibility_mode: "pin", pin: "424242" },
   });
   ok(el.status === 200 && el.json?.election?.id, "owner creates an election");
   const electionId = el.json.election.id;

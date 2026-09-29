@@ -16,7 +16,8 @@
     "smoke:auth": "node scripts/smoke-auth.mjs",
     "smoke:builder": "node scripts/smoke-builder.mjs",
     "smoke:eligibility": "node scripts/smoke-eligibility.mjs",
-    "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs"
+    "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs",
+    "smoke:guards": "node scripts/smoke-guards.mjs"
   },
   "dependencies": {
     "next": "^16.3.6",

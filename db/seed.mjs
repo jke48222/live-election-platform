@@ -83,7 +83,7 @@ async function main() {
       `INSERT INTO elections (org_id, slug, title, description, mode, status, eligibility_mode, pin)
        VALUES ($1,'spring-2026','Spring 2026 Board Election',
                'Sample election seeded for local development.',
-               'live_presenter','waiting','pin','1975') RETURNING id`,
+               'live_presenter','waiting','pin','197526') RETURNING id`,
       [orgId]
     );
     const electionId = election.rows[0].id;
@@ -110,7 +110,7 @@ async function main() {
       }
     }
     console.log(`✓ demo org + sample election created (org=${orgId})`);
-    console.log("  voter PIN: 1975 · election slug: demo/spring-2026");
+    console.log("  voter PIN: 197526 · election slug: demo/spring-2026");
   } finally {
     await c.end();
   }

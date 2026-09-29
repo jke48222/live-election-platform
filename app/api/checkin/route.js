@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { clientIpFromReq, deviceRateLimit, rateLimit } from "../../../lib/rate-limit";
+import { checkinGuard, SLOWDOWN_MS } from "../../../lib/checkin-guard";
 import { withOrg } from "../../../lib/db";
 import { emit, issueTicket } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
@@ -13,6 +14,8 @@ import {
 import { isDeviceId, voterKey } from "../../../lib/voter-identity";
 
 const MAX_NAME = 255;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Normalize a display name for same-name duplicate detection. */
 function nameKey(name) {
@@ -65,7 +68,7 @@ export async function POST(req) {
   }
 
   // A room on campus Wi-Fi shares one public IP, so the per-IP ceiling is
-  // high, and each device gets its own limit per election.
+  // high. Wrong answers are limited per IP and per device in lib/checkin-guard.
   const ip = clientIpFromReq(req);
   if (ip) {
     const perIp = rateLimit(`checkin-ip:${ip}`, 300, 60_000);
@@ -77,10 +80,26 @@ export async function POST(req) {
   const orgId = await resolveElectionOrg(electionId);
   if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
 
+  // Only this IP's or this device's own wrong answers can refuse it. Other
+  // people's wrong answers never block a voter who has the right PIN.
+  const source = { ip, deviceId };
+  const blocked = checkinGuard.sourceBlocked(electionId, source);
+  if (!blocked.ok) {
+    return tooMany(blocked.retryAfter, "Too many wrong attempts. Try again in a few minutes.");
+  }
+
   const key = voterKey(electionId, deviceId);
+  let wrongAnswer = false;
+
+  /** Count a wrong answer; tell the host's console when guessing looks deliberate. */
+  async function wrong(db, guess) {
+    wrongAnswer = true;
+    const { recent, alert } = checkinGuard.recordWrongAnswer(electionId, { ...source, guess });
+    if (alert) await emit(db, electionId, "checkin_failures", { recent }, { audience: "admin" });
+  }
 
   try {
-    return await withOrg(orgId, async (db) => {
+    const res = await withOrg(orgId, async (db) => {
       // One check-in at a time per election, so the duplicate-name check and
       // the roster, email or code claim cannot race.
       await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
@@ -96,6 +115,7 @@ export async function POST(req) {
 
       // Fails closed: a PIN election with no PIN set admits nobody.
       if (election.eligibility_mode === "pin" && !pinMatches(election.pin, pin)) {
+        await wrong(db, true);
         // The mode is public (GET /api/election returns it), and a voter page
         // that is still showing an older form uses it to switch fields.
         return NextResponse.json(
@@ -128,6 +148,9 @@ export async function POST(req) {
         { displayName: name, email, code, voterKey: key }
       );
       if (!elig.ok) {
+        // A wrong email is usually a typo, so it counts against its source
+        // but not toward the election-wide signal.
+        if (elig.failure) await wrong(db, election.eligibility_mode !== "email_magic_link");
         return NextResponse.json(
           { error: elig.error, code: elig.code, eligibility_mode: election.eligibility_mode },
           { status: elig.status || 403 }
@@ -159,6 +182,11 @@ export async function POST(req) {
         ticket: voterTicket(electionId),
       });
     });
+    // While someone is guessing, wrong answers come back slowly. The delay
+    // runs after the transaction, so it holds no lock or connection, and a
+    // right answer is never delayed.
+    if (wrongAnswer && checkinGuard.slowed(electionId)) await sleep(SLOWDOWN_MS);
+    return res;
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
@@ -203,6 +231,9 @@ function targetCheckin(body, electionId) {
 /**
  * GET: admin: list check-ins for an election. `device_hash` here is the
  * stored key, not the voter's device id, so the list holds no credential.
+ * `failures` is the election's recent wrong PINs and codes: { recent,
+ * window_minutes, slowed }. When `slowed` is true someone is guessing; the
+ * host can rotate the PIN (PATCH /api/elections) and clear the count.
  */
 export async function GET(req) {
   return withAdminElection(req, null, async (db, electionId) => {
@@ -220,12 +251,15 @@ export async function GET(req) {
       ...r,
       name_duplicate: (keyCounts.get(nameKey(r.display_name)) || 0) > 1,
     }));
-    return NextResponse.json({ checkins });
+    return NextResponse.json({ checkins, failures: checkinGuard.stats(electionId) });
   });
 }
 
 /**
  * PATCH { election_id, id | device_hash }: admin: verify a voter.
+ * PATCH { election_id, reset_failures: true }: admin: clear the election's
+ * wrong-answer count, which ends the slowdown. Per-IP and per-device limits
+ * are kept.
  */
 export async function PATCH(req) {
   let body;
@@ -235,6 +269,10 @@ export async function PATCH(req) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
   return withAdminElection(req, body, async (db, electionId) => {
+    if (body?.reset_failures === true) {
+      checkinGuard.reset(electionId);
+      return NextResponse.json({ ok: true, failures: checkinGuard.stats(electionId) });
+    }
     const target = targetCheckin(body, electionId);
     if (!target) return NextResponse.json({ error: "id or device_hash required" }, { status: 400 });
     const { rows } = await db.query(
