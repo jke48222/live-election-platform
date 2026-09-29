@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { query, withOrg } from "../../../lib/db";
 import { getSessionUser, getMembershipRole, authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
+import { emit } from "../../../lib/realtime";
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,48}[a-z0-9])?$/;
 const ELIGIBILITY = ["open", "pin", "roster_csv", "email_magic_link", "access_code", "sso_oidc"];
@@ -89,7 +90,15 @@ export async function POST(req) {
   }
 }
 
-/** PATCH /api/elections { election_id, title?, eligibility_mode?, pin? } — settings (idle only). */
+/**
+ * PATCH /api/elections { election_id, title?, eligibility_mode?, pin? }: settings
+ * (idle only).
+ *
+ * Changing eligibility_mode removes every check-in and releases every roster,
+ * email and code claim, because a check-in verified under the old mode (a PIN,
+ * say) says nothing about the new one. Connected voters get checkin_revoked
+ * { all: true } and settings_changed, and check in again under the new mode.
+ */
 export async function PATCH(req) {
   let body;
   try {
@@ -106,13 +115,18 @@ export async function PATCH(req) {
   try {
     const result = await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        "SELECT status, active_position_id, eligibility_mode FROM elections WHERE id = $1 FOR UPDATE",
         [body.election_id]
       );
-      if (!eRows[0]) return { error: "Election not found", status: 404 };
-      if (eRows[0].status === "voting" || eRows[0].active_position_id) {
+      const current = eRows[0];
+      if (!current) return { error: "Election not found", status: 404 };
+      if (current.status === "voting" || current.active_position_id) {
         return { error: "Finish the current poll before changing settings.", status: 409 };
       }
+      const nextMode = ELIGIBILITY.includes(body.eligibility_mode)
+        ? body.eligibility_mode
+        : current.eligibility_mode;
+      const modeChanged = nextMode !== current.eligibility_mode;
       const fields = [];
       const params = [];
       if (typeof body.title === "string" && body.title.trim()) {
@@ -120,7 +134,7 @@ export async function PATCH(req) {
         fields.push(`title = $${params.length}`);
       }
       if (ELIGIBILITY.includes(body.eligibility_mode)) {
-        params.push(body.eligibility_mode);
+        params.push(nextMode);
         fields.push(`eligibility_mode = $${params.length}`);
       }
       if (typeof body.pin === "string") {
@@ -135,7 +149,19 @@ export async function PATCH(req) {
           RETURNING id, slug, title, status, mode, eligibility_mode, pin`,
         params
       );
-      return { election: rows[0] };
+      if (!modeChanged) return { election: rows[0] };
+
+      const { rowCount: cleared } = await db.query(
+        "DELETE FROM checkins WHERE election_id = $1",
+        [body.election_id]
+      );
+      await db.query(
+        "UPDATE eligible_voters SET claimed_by_device = NULL WHERE election_id = $1",
+        [body.election_id]
+      );
+      await emit(db, body.election_id, "checkin_revoked", { all: true });
+      await emit(db, body.election_id, "settings_changed", { eligibility_mode: nextMode });
+      return { election: rows[0], checkins_cleared: cleared };
     });
     if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json(result);

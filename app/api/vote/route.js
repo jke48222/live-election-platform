@@ -1,19 +1,27 @@
 import { NextResponse } from "next/server";
-import { rateLimit } from "../../../lib/rate-limit";
+import { deviceRateLimit } from "../../../lib/rate-limit";
 import { withOrg } from "../../../lib/db";
 import { authorizeElection } from "../../../lib/auth";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
+import { ballotRef, isDeviceId, voterKey } from "../../../lib/voter-identity";
 
 /**
- * POST /api/vote — cast a vote. Server enforces eligibility, the poll window,
- * candidate validity, and one-vote-per-voter (DB unique constraint).
+ * POST /api/vote: cast a vote. Server enforces eligibility, the poll window,
+ * candidate validity, and one vote per voter per race.
  *
- * Eligibility is generalized from the NSBE dues roster into the election's
- * eligibility_mode:
+ * Eligibility comes from the election's eligibility_mode:
  *   - open                : no check-in required
  *   - pin / access_code   : a check-in row must exist for this device
  *   - roster_csv / email / sso : check-in must exist AND be verified
- * (Phase 5 fills in roster matching / magic links / SSO; this is the gate.)
+ *
+ * `device_hash` is the voter's secret device id. The ballot is recorded by
+ * cast_ballot() (db/migrations/0005) under ballotRef(): the claimed roster,
+ * email or access-code entry in those modes, otherwise the device's key. So
+ * one listed person gets one ballot per race however many devices they use.
+ *
+ * The election row is read FOR SHARE. /api/state takes it FOR UPDATE, so a
+ * vote either commits before a lock, finalize or clear-and-restart, or waits
+ * and then sees the new state. An old-round vote cannot land in a runoff.
  */
 export async function POST(req) {
   let body;
@@ -26,7 +34,7 @@ export async function POST(req) {
   const electionId = typeof body?.election_id === "string" ? body.election_id.trim() : "";
   const positionId = typeof body?.position_id === "string" ? body.position_id.trim() : "";
   const candidateId = typeof body?.candidate_id === "string" ? body.candidate_id.trim() : "";
-  const deviceHash = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
+  const deviceId = typeof body?.device_hash === "string" ? body.device_hash.trim() : "";
 
   if (!isUuid(electionId) || !isUuid(positionId) || !isUuid(candidateId)) {
     return NextResponse.json(
@@ -34,13 +42,13 @@ export async function POST(req) {
       { status: 400 }
     );
   }
-  // F8: exact 64-char lowercase hex device hash.
-  if (!/^[0-9a-f]{64}$/.test(deviceHash)) {
+  if (!isDeviceId(deviceId)) {
     return NextResponse.json({ error: "A valid device_hash is required." }, { status: 400 });
   }
 
-  // F14: throttle per device.
-  const limited = rateLimit(`vote:${deviceHash}`, 20, 10_000);
+  // Throttle per device. Kept apart from the IP and account limits, so a
+  // flood of made-up device ids cannot push those out.
+  const limited = deviceRateLimit(`vote:${deviceId}`, 20, 10_000);
   if (!limited.ok) {
     return NextResponse.json(
       { error: "Too many requests. Slow down." },
@@ -50,12 +58,13 @@ export async function POST(req) {
 
   const orgId = await resolveElectionOrg(electionId);
   if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });
+  const key = voterKey(electionId, deviceId);
 
   try {
     return await withOrg(orgId, async (db) => {
       const { rows: eRows } = await db.query(
         `SELECT status, active_position_id, poll_expires_at, eligibility_mode
-           FROM elections WHERE id = $1`,
+           FROM elections WHERE id = $1 FOR SHARE`,
         [electionId]
       );
       const election = eRows[0];
@@ -80,7 +89,7 @@ export async function POST(req) {
       if (mode !== "open") {
         const { rows: cRows } = await db.query(
           "SELECT verified FROM checkins WHERE election_id=$1 AND device_hash=$2",
-          [electionId, deviceHash]
+          [electionId, key]
         );
         const checkin = cRows[0];
         if (!checkin) {
@@ -110,17 +119,22 @@ export async function POST(req) {
         return NextResponse.json({ error: "Invalid candidate for this race." }, { status: 400 });
       }
 
-      // Insert vote; voter_identity is the device hash for device-based modes.
-      try {
-        await db.query(
-          `INSERT INTO votes (election_id, org_id, position_id, candidate_id, voter_identity)
-           VALUES ($1, nullif(current_setting('app.current_org',true),'')::uuid, $2, $3, $4)`,
-          [electionId, positionId, candidateId, deviceHash]
+      const ref = await ballotRef(db, electionId, mode, key);
+      // Every email or code check-in holds an entry. One without (its entry
+      // was deleted) must check in again rather than vote as the device.
+      if ((mode === "email_magic_link" || mode === "access_code") && ref === key) {
+        return NextResponse.json(
+          { error: "Not checked in. Rejoin from the start screen.", code: "not_checked_in" },
+          { status: 403 }
         );
-      } catch (err) {
-        if (err.code === "23505") return NextResponse.json({ ok: true, duplicate: true });
-        throw err;
       }
+      const { rows: cast } = await db.query("SELECT cast_ballot($1, $2, $3, $4) AS recorded", [
+        electionId,
+        positionId,
+        candidateId,
+        ref,
+      ]);
+      if (!cast[0]?.recorded) return NextResponse.json({ ok: true, duplicate: true, code: "already_voted" });
       return NextResponse.json({ ok: true });
     });
   } catch (err) {
@@ -128,7 +142,7 @@ export async function POST(req) {
   }
 }
 
-/** GET /api/vote?election_id=&position_id= — admin: live counts per candidate. */
+/** GET /api/vote?election_id=&position_id=: admin: live counts per candidate. */
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const electionId = searchParams.get("election_id") || "";
@@ -142,8 +156,9 @@ export async function GET(req) {
   try {
     const { counts, total } = await withOrg(auth.orgId, async (db) => {
       const { rows } = await db.query(
-        "SELECT candidate_id, count(*)::int AS n FROM votes WHERE position_id=$1 GROUP BY candidate_id",
-        [positionId]
+        `SELECT candidate_id, count(*)::int AS n FROM votes
+          WHERE position_id=$1 AND election_id=$2 GROUP BY candidate_id`,
+        [positionId, electionId]
       );
       const counts = {};
       let total = 0;
