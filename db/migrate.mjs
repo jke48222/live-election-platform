@@ -4,40 +4,55 @@
  *
  *   node --env-file=.env.local db/migrate.mjs
  *
- * Connects as a superuser/owner (DATABASE_URL), ensures the least-
+ * Connects as the database owner (DATABASE_URL), makes sure the least-
  * privilege `app` login role exists, then applies every *.sql file in
  * db/migrations in lexical order exactly once, tracked in schema_migrations.
  *
- * Migrations are environment-agnostic schema; the `app` role + its
+ * Migrations are environment-agnostic schema. The `app` role and its
  * password are environment setup, so they live here, driven by env:
- *   APP_DB_PASSWORD   password to assign the `app` role (default for local dev)
+ *   APP_DB_PASSWORD   password for the `app` role. Required outside
+ *                     NODE_ENV=development. When set, it is applied to the
+ *                     role on every run; when unset in development, a
+ *                     missing role is created with the local dev password
+ *                     and an existing role is left alone. See db/app-role.mjs.
  */
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { planAppRole, pgLiteral } from "./app-role.mjs";
+import { describeDbError } from "../lib/db.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, "migrations");
 
 const DATABASE_URL =
-  process.env.DATABASE_URL || "postgres://localhost:5432/elections";
-const APP_DB_PASSWORD = process.env.APP_DB_PASSWORD || "app_local_dev";
+  process.env.DATABASE_URL ||
+  (process.env.NODE_ENV === "development" ? "postgres://localhost:5432/elections" : "");
 
 async function main() {
+  if (!DATABASE_URL) {
+    throw new Error("DATABASE_URL is not set. Point it at the database owner role.");
+  }
+  // Refuse before connecting, so a bad environment changes nothing.
+  const preflight = planAppRole({ roleExists: true });
+  if (preflight.action === "error") throw new Error(preflight.message);
+
   const client = new pg.Client({ connectionString: DATABASE_URL });
   await client.connect();
   try {
-    // 1. Ensure the least-privilege app login role exists.
-    // CREATE/ALTER ROLE are utility statements — they can't take bind
-    // parameters, so the password is inlined as a safely-escaped literal.
-    const pwLiteral = "'" + String(APP_DB_PASSWORD).replace(/'/g, "''") + "'";
-    const roleExists = await client.query("SELECT 1 FROM pg_roles WHERE rolname = 'app'");
-    if (roleExists.rows.length === 0) {
-      await client.query(`CREATE ROLE app LOGIN PASSWORD ${pwLiteral}`);
-    } else {
-      await client.query(`ALTER ROLE app LOGIN PASSWORD ${pwLiteral}`);
+    // 1. Make sure the least-privilege app login role exists. Its password
+    // is only written when the role is created or APP_DB_PASSWORD is set.
+    const roleExists =
+      (await client.query("SELECT 1 FROM pg_roles WHERE rolname = 'app'")).rows.length > 0;
+    const plan = planAppRole({ roleExists });
+    if (plan.action === "error") throw new Error(plan.message);
+    if (plan.action === "create") {
+      await client.query(`CREATE ROLE app LOGIN PASSWORD ${pgLiteral(plan.password)}`);
+    } else if (plan.action === "alter") {
+      await client.query(`ALTER ROLE app LOGIN PASSWORD ${pgLiteral(plan.password)}`);
     }
+    if (plan.note) console.log(plan.note);
 
     // 2. Migration bookkeeping table.
     await client.query(`
@@ -79,6 +94,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(describeDbError(err, DATABASE_URL));
   process.exit(1);
 });

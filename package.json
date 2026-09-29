@@ -1,32 +1,40 @@
 {
-  "name": "nsbe-election",
+  "name": "live-election-platform",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "test": "node --test lib/tests/*.test.mjs app/_lib/*.test.mjs db/tests/*.test.mjs services/realtime/test/*.test.mjs scripts/tests/*.test.mjs",
     "start": "next start",
     "db:migrate": "node --env-file=.env.local db/migrate.mjs",
+    "dev:db:migrate": "NODE_ENV=development node --env-file=.env.local db/migrate.mjs",
     "db:seed": "node --env-file=.env.local db/seed.mjs",
     "db:verify": "node --env-file=.env.local db/verify-rls.mjs",
     "realtime": "node --env-file=.env.local services/realtime/server.mjs",
+    "dev:realtime": "NODE_ENV=development node --env-file=.env.local services/realtime/server.mjs",
     "realtime:verify": "node --env-file=.env.local services/realtime/verify-realtime.mjs",
     "smoke:backend": "node scripts/smoke-backend.mjs",
     "smoke:auth": "node scripts/smoke-auth.mjs",
     "smoke:builder": "node scripts/smoke-builder.mjs",
     "smoke:eligibility": "node scripts/smoke-eligibility.mjs",
-    "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs"
+    "smoke:realtime": "node scripts/smoke-realtime-e2e.mjs",
+    "smoke:guards": "node scripts/smoke-guards.mjs"
   },
   "dependencies": {
-    "next": "^14.2.15",
+    "next": "^16.3.6",
     "pg": "^8.21.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "pg-connection-string": "^2.13.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.47",
-    "tailwindcss": "^3.4.13"
+    "autoprefixer": "^10.6.1",
+    "postcss": "^8.5.28",
+    "tailwindcss": "^3.4.19"
   }
 }

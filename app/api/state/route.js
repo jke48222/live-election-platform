@@ -3,6 +3,18 @@ import { withOrg } from "../../../lib/db";
 import { emit } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
 import { isUuid, clampDuration } from "../../../lib/api-helpers";
+import { canResetPosition } from "../../_lib/poll";
+import { guardStateAction } from "../../../lib/state-guards";
+
+/** state_change payload; server_now lets clients correct for clock skew. */
+function statePayload(status, activePositionId, pollExpiresAt) {
+  return {
+    status,
+    active_position_id: activePositionId,
+    poll_expires_at: pollExpiresAt,
+    server_now: new Date().toISOString(),
+  };
+}
 
 /**
  * Election state machine — self-hosted Postgres + realtime NOTIFY.
@@ -32,12 +44,23 @@ export async function POST(req) {
   try {
     return await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT id, status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
+        "SELECT id, status, active_position_id, poll_expires_at FROM elections WHERE id = $1 FOR UPDATE",
         [electionId]
       );
       const election = eRows[0];
       if (!election) {
         return NextResponse.json({ error: "Election not found" }, { status: 404 });
+      }
+
+      // lock, finalize and clear_restart need a poll in the right state, and
+      // refuse when the caller names a different poll than the live one
+      // (a stale admin tab). See lib/state-guards.js.
+      const refused = guardStateAction(action, election, body);
+      if (refused) {
+        return NextResponse.json(
+          { error: refused.error, code: refused.code },
+          { status: refused.status }
+        );
       }
 
       // ── LAUNCH a position's poll ──
@@ -75,11 +98,12 @@ export async function POST(req) {
              poll_expires_at=$2, updated_at=now() WHERE id=$3`,
           [positionId, expiresAt, electionId]
         );
-        await emit(db, electionId, "state_change", {
-          status: "voting",
-          active_position_id: positionId,
-          poll_expires_at: expiresAt,
-        });
+        await emit(
+          db,
+          electionId,
+          "state_change",
+          statePayload("voting", positionId, expiresAt)
+        );
         return NextResponse.json({ ok: true });
       }
 
@@ -90,11 +114,12 @@ export async function POST(req) {
           "UPDATE elections SET status='locked', poll_expires_at=$1, updated_at=now() WHERE id=$2",
           [now, electionId]
         );
-        await emit(db, electionId, "state_change", {
-          status: "locked",
-          active_position_id: election.active_position_id,
-          poll_expires_at: now,
-        });
+        await emit(
+          db,
+          electionId,
+          "state_change",
+          statePayload("locked", election.active_position_id, now)
+        );
         return NextResponse.json({ ok: true });
       }
 
@@ -116,19 +141,17 @@ export async function POST(req) {
              poll_expires_at=NULL, updated_at=now() WHERE id=$2`,
           [nextStatus, electionId]
         );
-        await emit(db, electionId, "state_change", {
-          status: nextStatus,
-          active_position_id: null,
-          poll_expires_at: null,
-        });
+        await emit(
+          db,
+          electionId,
+          "state_change",
+          statePayload(nextStatus, null, null)
+        );
         return NextResponse.json({ ok: true });
       }
 
       // ── CLEAR votes & relaunch (tie-breaker / runoff) ──
       if (action === "clear_restart") {
-        if (!election.active_position_id) {
-          return NextResponse.json({ error: "No active position" }, { status: 400 });
-        }
         const duration = clampDuration(body.duration);
         await db.query("DELETE FROM votes WHERE position_id=$1", [
           election.active_position_id,
@@ -141,36 +164,51 @@ export async function POST(req) {
         await emit(db, electionId, "purge", {
           position_id: election.active_position_id,
         });
-        await emit(db, electionId, "state_change", {
-          status: "voting",
-          active_position_id: election.active_position_id,
-          poll_expires_at: expiresAt,
-        });
+        await emit(
+          db,
+          electionId,
+          "state_change",
+          statePayload("voting", election.active_position_id, expiresAt)
+        );
         return NextResponse.json({ ok: true });
       }
 
       // ── RESET one position (votes + un-finalize), room idle only ──
+      // Idle includes 'completed': a race finalized by mistake can be re-run
+      // after the last race closes. The election goes back to 'waiting' so
+      // the reset race can be launched again.
       if (action === "reset_position") {
         const positionId =
           typeof body.position_id === "string" ? body.position_id.trim() : "";
         if (!isUuid(positionId)) {
           return NextResponse.json({ error: "position_id required" }, { status: 400 });
         }
-        if (election.status !== "waiting" || election.active_position_id) {
+        if (!canResetPosition(election)) {
           return NextResponse.json(
-            { error: "Reset a position only when the room is waiting (no live or locked poll)." },
+            { error: "Reset a position only when no poll is live or locked." },
             { status: 409 }
           );
+        }
+        const { rowCount } = await db.query(
+          "UPDATE positions SET is_completed=false WHERE id=$1 AND election_id=$2",
+          [positionId, electionId]
+        );
+        if (!rowCount) {
+          return NextResponse.json({ error: "Unknown position_id" }, { status: 404 });
         }
         await db.query("DELETE FROM votes WHERE position_id=$1 AND election_id=$2", [
           positionId,
           electionId,
         ]);
-        await db.query(
-          "UPDATE positions SET is_completed=false WHERE id=$1 AND election_id=$2",
-          [positionId, electionId]
-        );
+        if (election.status !== "waiting") {
+          await db.query(
+            `UPDATE elections SET status='waiting', active_position_id=NULL,
+               poll_expires_at=NULL, updated_at=now() WHERE id=$1`,
+            [electionId]
+          );
+        }
         await emit(db, electionId, "purge", { position_id: positionId });
+        await emit(db, electionId, "state_change", statePayload("waiting", null, null));
         return NextResponse.json({ ok: true });
       }
 
@@ -178,7 +216,7 @@ export async function POST(req) {
       if (action === "reset_all_results") {
         if (election.status === "voting" || election.active_position_id) {
           return NextResponse.json(
-            { error: "Finish or lock the current poll before resetting the entire election." },
+            { error: "Finalize the current poll before resetting the entire election." },
             { status: 409 }
           );
         }
@@ -192,11 +230,12 @@ export async function POST(req) {
           [electionId]
         );
         await emit(db, electionId, "purge", { all: true });
-        await emit(db, electionId, "state_change", {
-          status: "waiting",
-          active_position_id: null,
-          poll_expires_at: null,
-        });
+        await emit(
+          db,
+          electionId,
+          "state_change",
+          statePayload("waiting", null, null)
+        );
         return NextResponse.json({ ok: true });
       }
 

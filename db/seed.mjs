@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * DEV-ONLY seed — generic demo data, NO hardcoded NSBE slate.
+ * Dev-only seed: generic demo data, with no real slate of candidates.
  *
  *   node --env-file=.env.local db/seed.mjs
  *
@@ -14,6 +14,7 @@
  */
 import pg from "pg";
 import { hashPassword } from "../lib/auth.js";
+import { describeDbError } from "../lib/db.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL || "postgres://localhost:5432/elections";
@@ -69,7 +70,7 @@ async function main() {
        VALUES ($1, $2, $3, true)
        ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash
        RETURNING id`,
-      [DEMO_USER.email, hashPassword(DEMO_USER.password), DEMO_USER.name]
+      [DEMO_USER.email, await hashPassword(DEMO_USER.password), DEMO_USER.name]
     );
     await c.query(
       `INSERT INTO memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')
@@ -82,7 +83,7 @@ async function main() {
       `INSERT INTO elections (org_id, slug, title, description, mode, status, eligibility_mode, pin)
        VALUES ($1,'spring-2026','Spring 2026 Board Election',
                'Sample election seeded for local development.',
-               'live_presenter','waiting','pin','1975') RETURNING id`,
+               'live_presenter','waiting','pin','197526') RETURNING id`,
       [orgId]
     );
     const electionId = election.rows[0].id;
@@ -109,13 +110,13 @@ async function main() {
       }
     }
     console.log(`✓ demo org + sample election created (org=${orgId})`);
-    console.log("  voter PIN: 1975 · election slug: demo/spring-2026");
+    console.log("  voter PIN: 197526 · election slug: demo/spring-2026");
   } finally {
     await c.end();
   }
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(describeDbError(err, DATABASE_URL));
   process.exit(1);
 });

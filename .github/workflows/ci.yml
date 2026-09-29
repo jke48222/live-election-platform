@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: elections
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d elections"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Owner: migrations, seed and db:verify only.
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/elections
+      # The least-privilege role the web server and gateway use.
+      APP_DATABASE_URL: postgres://app:ci_app_password@127.0.0.1:5432/elections
+      APP_DB_PASSWORD: ci_app_password
+      # CI-only key; `next start` runs with NODE_ENV=production and needs one.
+      REALTIME_SECRET: ci-only-realtime-secret-not-used-anywhere-else
+      REALTIME_PORT: "3001"
+      NEXT_PUBLIC_REALTIME_URL: ws://127.0.0.1:3001
+      REALTIME_TEST_URL: ws://127.0.0.1:3001
+      # realtime:verify and the realtime smoke test must see a subscribe with
+      # no ticket refused, as it is in production.
+      REALTIME_EXPECT_TICKETS: "1"
+      BASE_URL: http://127.0.0.1:3000
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Migrate
+        run: node db/migrate.mjs
+
+      - name: Migrate again (must be a no-op)
+        run: node db/migrate.mjs | tee migrate-again.log && grep -q "Already up to date." migrate-again.log
+
+      - name: Seed
+        run: node db/seed.mjs
+
+      - name: Verify row-level security
+        run: node db/verify-rls.mjs
+
+      # Both servers run as they would in production. The gateway requires a
+      # signed ticket to subscribe and checks Origin against the allowlist.
+      - name: Start the realtime gateway and the app
+        env:
+          NODE_ENV: production
+          REALTIME_ALLOWED_ORIGINS: http://127.0.0.1:3000
+        run: |
+          nohup node services/realtime/server.mjs > realtime.log 2>&1 &
+          nohup npx next start -p 3000 -H 127.0.0.1 > next.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3001/health > /dev/null && curl -fsS -o /dev/null http://127.0.0.1:3000/; then
+              echo "both are up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "the gateway or the app did not come up"; exit 1
+
+      - name: Verify the realtime gateway
+        run: node services/realtime/verify-realtime.mjs
+
+      - name: Smoke test, backend
+        run: node scripts/smoke-backend.mjs
+
+      - name: Smoke test, auth
+        run: node scripts/smoke-auth.mjs
+
+      - name: Smoke test, builder
+        run: node scripts/smoke-builder.mjs
+
+      - name: Smoke test, eligibility
+        run: node scripts/smoke-eligibility.mjs
+
+      - name: Smoke test, realtime end to end
+        run: node scripts/smoke-realtime-e2e.mjs
+
+      # Last of the smoke tests: its final check locks the demo account for
+      # logins without the known-device cookie.
+      - name: Smoke test, check-in, login and results guards
+        run: node scripts/smoke-guards.mjs
+
+      # A production server missing a required setting, or given a value
+      # published in this repo, must exit, not come up half-working. So must
+      # db:migrate given the dev app password. `timeout` exits 124 if a server
+      # keeps running.
+      - name: Production servers refuse missing or published settings
+        run: |
+          refuses() {
+            local label=$1; shift
+            set +e
+            timeout 60 "$@" > refuse.log 2>&1
+            local code=$?
+            set -e
+            if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then
+              echo "::error::$label started anyway (exit $code)"; cat refuse.log; exit 1
+            fi
+            echo "$label refused to start (exit $code):"
+            grep -m1 -E 'not set|must|Refusing' refuse.log || true
+          }
+          refuses "next start without APP_DATABASE_URL" env -u APP_DATABASE_URL npx next start -p 3002 -H 127.0.0.1
+          refuses "next start without REALTIME_SECRET" env -u REALTIME_SECRET npx next start -p 3002 -H 127.0.0.1
+          refuses "next start with a short REALTIME_SECRET" env REALTIME_SECRET=too-short npx next start -p 3002 -H 127.0.0.1
+          refuses "next start with the example REALTIME_SECRET" env REALTIME_SECRET=local-only-realtime-secret-replace-before-deploying npx next start -p 3002 -H 127.0.0.1
+          refuses "next start with the dev app password" env APP_DATABASE_URL=postgres://app:app_local_dev@127.0.0.1:5432/elections npx next start -p 3002 -H 127.0.0.1
+          refuses "gateway without APP_DATABASE_URL" env -u APP_DATABASE_URL NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway without REALTIME_SECRET" env -u REALTIME_SECRET NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway with the example REALTIME_SECRET" env REALTIME_SECRET=local-only-realtime-secret-replace-before-deploying NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway with the dev app password" env APP_DATABASE_URL=postgres://app:app_local_dev@127.0.0.1:5432/elections NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway without REALTIME_ALLOWED_ORIGINS" env NODE_ENV=production REALTIME_PORT=3003 node services/realtime/server.mjs
+          refuses "db:migrate with the dev app password" env APP_DB_PASSWORD=app_local_dev node db/migrate.mjs
+
+      - name: Server logs
+        if: failure()
+        run: |
+          echo "::group::realtime.log"; cat realtime.log || true; echo "::endgroup::"
+          echo "::group::next.log"; cat next.log || true; echo "::endgroup::"

@@ -32,7 +32,7 @@ async function main() {
 
   const create = await api("/api/elections", {
     method: "POST",
-    body: { org_slug: "demo", title: "Builder Test", slug, eligibility_mode: "pin", pin: "1234" },
+    body: { org_slug: "demo", title: "Builder Test", slug, eligibility_mode: "pin", pin: "123456" },
   });
   ok(create.status === 200, "create throwaway election");
   const electionId = create.json.election.id;

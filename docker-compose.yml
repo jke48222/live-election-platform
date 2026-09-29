@@ -1,10 +1,19 @@
-# Local self-hosted Postgres for development.
-# (The full self-host stack — app + realtime gateway + Caddy TLS + MinIO —
-#  is assembled in Phase 8. This is just the database for Phase 1.)
+# Local Postgres 16 for development. This is the database only; the web
+# server and the realtime gateway run on the host with npm scripts.
 #
 #   docker compose up -d
-#   DATABASE_URL=postgres://postgres:postgres@localhost:5432/elections \
-#     node --env-file=.env.local db/migrate.mjs
+#   npm run dev:db:migrate && npm run db:seed && npm run db:verify
+#
+# with these in .env.local:
+#   DATABASE_URL=postgres://postgres:postgres@localhost:5432/elections
+#   APP_DATABASE_URL=postgres://app:app_local_dev@localhost:5432/elections
+#   APP_DB_PASSWORD=app_local_dev
+#
+# Outside NODE_ENV=development, `npm run db:migrate`, `npm run realtime` and
+# `npm start` refuse the app_local_dev password.
+#
+# The port is bound to 127.0.0.1 so the database, and its public dev
+# passwords, are never reachable from other machines.
 services:
   postgres:
     image: postgres:16
@@ -14,7 +23,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: elections
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

@@ -1,177 +1,121 @@
 #!/usr/bin/env node
 /**
- * Self-hosted realtime gateway — replaces Supabase Broadcast.
+ * Self-hosted realtime gateway.
  *
  *   node --env-file=.env.local services/realtime/server.mjs
+ *   NODE_ENV=development node --env-file=.env.local services/realtime/server.mjs
  *
- * A single long-lived Postgres connection LISTENs on the `election_events`
- * channel. API routes emit events with pg_notify (see lib/realtime.js) inside
- * their transaction, so a NOTIFY fires only when the DB change commits. Each
- * notification carries { electionId, event, data }; the gateway fans it out
- * over WebSocket to every client subscribed to that election's room.
+ * One long-lived Postgres connection LISTENs on the `election_events` channel.
+ * API routes emit events with pg_notify (see lib/realtime.js) inside their
+ * transaction, so a NOTIFY fires only when the change commits. Each
+ * notification carries { electionId, event, data }; the gateway relays it over
+ * WebSocket to every client subscribed to that election's room. The protocol
+ * and the limits on anonymous clients are described in gateway.mjs.
  *
- * Protocol (JSON text frames):
- *   client → { type:'subscribe', election:'<uuid>' } | { type:'ping' }
- *   server → { type:'subscribed', election } | { type:'event', event, data } | { type:'pong' }
+ * NOTIFY is fire-and-forget: anything sent while the LISTEN connection is down
+ * is lost. So when that connection drops, clients get { type:'status',
+ * live:false } and should poll; when it comes back they get live:true and a
+ * 'resync' event telling them to refetch.
  *
- * Also serves GET /health for ops checks.
+ * Env (read by config.mjs). Only NODE_ENV=development counts as development,
+ * the same rule as lib/db.js. NODE_ENV unset, "test" or anything else is
+ * production, where the first three settings below are required, the local
+ * example values are refused, and a signed ticket is always needed to
+ * subscribe.
+ *   APP_DATABASE_URL          least-privilege `app` role. The gateway never falls
+ *                             back to DATABASE_URL (the owner role), which
+ *                             bypasses row-level security.
+ *   REALTIME_SECRET           HMAC key shared with the app for subscribe tickets
+ *                             and voter tags (32+ chars)
+ *   REALTIME_ALLOWED_ORIGINS  comma-separated browser origins allowed to connect,
+ *                             e.g. https://vote.example.org
+ *   REALTIME_PORT             default 3001
+ *   REALTIME_HOST             bind address, default all interfaces
+ *   REALTIME_REQUIRE_TICKET   "1" to require tickets in development too
+ *   REALTIME_TRUST_PROXY      "1" when behind a reverse proxy that sets
+ *                             X-Forwarded-For, so per-IP caps see real clients
+ *   REALTIME_MAX_CONNECTIONS_PER_IP  default 500 (a venue's voters share one NAT IP)
+ *   REALTIME_MAX_CONNECTIONS         default 20000
+ *
+ * For local development run it with NODE_ENV=development.
+ *
+ * Also serves GET /health (503 while the LISTEN connection is down).
  */
-import http from "node:http";
-import { WebSocketServer } from "ws";
 import pg from "pg";
+import { assertRlsEnforced, describeDbError } from "../../lib/db.js";
+import { createGateway, createListener } from "./gateway.mjs";
+import { resolveGatewayConfig } from "./config.mjs";
 
-const PORT = Number(process.env.REALTIME_PORT || 3001);
-const PG_URL =
-  process.env.APP_DATABASE_URL ||
-  process.env.DATABASE_URL ||
-  "postgres://app:app_local_dev@localhost:5432/elections";
-const NOTIFY_CHANNEL = "election_events";
-
-/** electionId -> Set<WebSocket> */
-const rooms = new Map();
-
-function joinRoom(electionId, ws) {
-  if (ws._room) leaveRoom(ws);
-  let set = rooms.get(electionId);
-  if (!set) rooms.set(electionId, (set = new Set()));
-  set.add(ws);
-  ws._room = electionId;
+function fail(message) {
+  console.error(`[realtime] ${message}`);
+  process.exit(1);
 }
 
-function leaveRoom(ws) {
-  const id = ws._room;
-  if (!id) return;
-  const set = rooms.get(id);
-  if (set) {
-    set.delete(ws);
-    if (set.size === 0) rooms.delete(id);
-  }
-  ws._room = null;
+let config;
+try {
+  config = resolveGatewayConfig(process.env);
+} catch (err) {
+  fail(err.message);
 }
+for (const warning of config.warnings) console.warn(`[realtime] ${warning}`);
+const { pgUrl } = config;
 
-function fanout(electionId, event, data) {
-  const set = rooms.get(electionId);
-  if (!set || set.size === 0) return 0;
-  const frame = JSON.stringify({ type: "event", event, data });
-  let sent = 0;
-  for (const ws of set) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(frame);
-      sent++;
-    }
-  }
-  return sent;
-}
-
-// ── Postgres LISTEN with auto-reconnect ──
-let listenClient;
-async function startListener() {
-  listenClient = new pg.Client({ connectionString: PG_URL });
-  listenClient.on("error", (err) => {
-    console.error("[realtime] pg listen error:", err.message);
-    setTimeout(retryListener, 1000);
-  });
-  listenClient.on("notification", (msg) => {
-    if (msg.channel !== NOTIFY_CHANNEL || !msg.payload) return;
-    let parsed;
-    try {
-      parsed = JSON.parse(msg.payload);
-    } catch {
-      console.error("[realtime] bad notify payload:", msg.payload);
-      return;
-    }
-    const { electionId, event, data } = parsed || {};
-    if (!electionId || !event) return;
-    fanout(electionId, event, data);
-  });
-  await listenClient.connect();
-  await listenClient.query(`LISTEN ${NOTIFY_CHANNEL}`);
-  console.log(`[realtime] LISTEN ${NOTIFY_CHANNEL} on ${PG_URL.replace(/:[^:@/]+@/, ":***@")}`);
-}
-
-let retrying = false;
-async function retryListener() {
-  if (retrying) return;
-  retrying = true;
-  try {
-    try {
-      await listenClient?.end();
-    } catch {
-      /* ignore */
-    }
-    await startListener();
-  } catch (err) {
-    console.error("[realtime] reconnect failed, retrying:", err.message);
-    setTimeout(retryListener, 2000);
-  } finally {
-    retrying = false;
-  }
-}
-
-// ── HTTP + WebSocket server ──
-const httpServer = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url.startsWith("/health")) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
+let listener;
+const gateway = createGateway({
+  allowedOrigins: config.allowedOrigins,
+  requireTicket: config.requireTicket,
+  secret: config.secret,
+  trustProxy: config.trustProxy,
+  maxConnectionsPerIp: config.maxConnectionsPerIp,
+  maxConnections: config.maxConnections,
+  isLive: () => Boolean(listener?.live),
 });
 
-const wss = new WebSocketServer({ server: httpServer });
-
-wss.on("connection", (ws) => {
-  ws.isAlive = true;
-  ws.on("pong", () => {
-    ws.isAlive = true;
-  });
-  ws.on("message", (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-    if (msg.type === "subscribe" && typeof msg.election === "string") {
-      joinRoom(msg.election, ws);
-      ws.send(JSON.stringify({ type: "subscribed", election: msg.election }));
-    } else if (msg.type === "ping") {
-      ws.send(JSON.stringify({ type: "pong" }));
-    }
-  });
-  ws.on("close", () => leaveRoom(ws));
-  ws.on("error", () => leaveRoom(ws));
+listener = createListener({
+  createClient: () =>
+    new pg.Client({
+      connectionString: pgUrl,
+      application_name: "realtime-gateway-listen",
+      // Without keepalive a silently dropped TCP connection is never noticed.
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
+    }),
+  onPayload: (payload) => gateway.handleNotify(payload),
+  onLiveChange: (live, info) => {
+    if (live) console.log(`[realtime] LISTEN election_events on ${pgUrl.replace(/:[^:@/]+@/, ":***@")}`);
+    else console.error("[realtime] LISTEN is down; clients were told to poll");
+    gateway.handleLiveChange(live, info);
+  },
 });
 
-// Heartbeat: drop dead sockets every 30s.
-const heartbeat = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) {
-      leaveRoom(ws);
-      ws.terminate();
-      continue;
-    }
-    ws.isAlive = false;
-    ws.ping();
-  }
-}, 30_000);
-
-function shutdown() {
-  clearInterval(heartbeat);
-  wss.close();
-  httpServer.close();
-  listenClient?.end().catch(() => {});
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.allSettled([listener.stop(), gateway.close()]);
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-startListener()
-  .then(() => {
-    httpServer.listen(PORT, () => console.log(`[realtime] gateway on :${PORT}`));
-  })
-  .catch((err) => {
-    console.error("[realtime] failed to start:", err);
-    process.exit(1);
-  });
+// Refuse a role that would skip row-level security (superuser, BYPASSRLS or a
+// table owner), the same check the web server runs before its first query.
+try {
+  const check = new pg.Client({ connectionString: pgUrl, application_name: "realtime-gateway-check" });
+  await check.connect();
+  try {
+    await assertRlsEnforced(check);
+  } finally {
+    await check.end().catch(() => {});
+  }
+} catch (err) {
+  fail(describeDbError(err, pgUrl));
+}
+
+try {
+  await listener.start();
+} catch (err) {
+  fail(`failed to start: ${describeDbError(err, pgUrl)}`);
+}
+const bound = await gateway.listen(config.port, config.host).catch((err) => fail(err.message));
+console.log(`[realtime] gateway on :${bound}`);

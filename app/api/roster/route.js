@@ -4,6 +4,8 @@ import { withOrg } from "../../../lib/db";
 import { authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
 import { normalizeIdentifier } from "../../../lib/eligibility";
+import { emit } from "../../../lib/realtime";
+import { isIdle } from "../../../lib/state-guards";
 
 /**
  * Roster / eligibility-list management for an election (admin only). Backs the
@@ -12,7 +14,28 @@ import { normalizeIdentifier } from "../../../lib/eligibility";
  *   POST   { identifiers | text } → bulk add names/emails (roster/email modes)
  *   POST   { generate_codes: N }  → mint N single-use access codes
  *   DELETE { id } | { all:true }  → remove one entry or clear the list
+ *
+ * Adding names or emails and removing entries wait until no poll is live or
+ * locked (409 otherwise), the rule positions and candidates follow. A person
+ * removed mid-race could be verified by hand as a walk-in and vote again in
+ * that race under their device, and one added mid-race could re-check in and
+ * vote again under the new entry. Ballots are recorded under a hash of the
+ * entry's name, email or code (lib/voter-identity.js entryRef), so deleting
+ * and re-adding the same entry between races gives nobody a second vote.
+ * Access codes can still be generated during a poll: each new code is a new
+ * identity that only the host hands out, for late arrivals.
  */
+
+const LIVE = "Finish the current poll before changing the voter list.";
+
+/** Lock the election row and report whether the list may change now. */
+async function listEditable(db, electionId) {
+  const { rows } = await db.query(
+    "SELECT status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
+    [electionId]
+  );
+  return isIdle(rows[0]);
+}
 
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no ambiguous chars
 const MAX_ITEMS = 5000;
@@ -101,6 +124,7 @@ export async function POST(req) {
     }
 
     const added = await withOrg(auth.orgId, async (db) => {
+      if (!(await listEditable(db, body.election_id))) return -1;
       let count = 0;
       for (const id of items) {
         const { rowCount } = await db.query(
@@ -113,6 +137,7 @@ export async function POST(req) {
       }
       return count;
     });
+    if (added === -1) return NextResponse.json({ error: LIVE }, { status: 409 });
     return NextResponse.json({ added, submitted: items.length });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });
@@ -131,18 +156,41 @@ export async function DELETE(req) {
 
   try {
     const removed = await withOrg(auth.orgId, async (db) => {
+      if (!body.all && !isUuid(body.id)) return -1;
+      if (!(await listEditable(db, body.election_id))) return -2;
+      let rows;
       if (body.all) {
-        const { rowCount } = await db.query("DELETE FROM eligible_voters WHERE election_id = $1", [body.election_id]);
-        return rowCount;
+        ({ rows } = await db.query(
+          "DELETE FROM eligible_voters WHERE election_id = $1 RETURNING claimed_by_device",
+          [body.election_id]
+        ));
+      } else {
+        ({ rows } = await db.query(
+          "DELETE FROM eligible_voters WHERE id = $1 AND election_id = $2 RETURNING claimed_by_device",
+          [body.id, body.election_id]
+        ));
       }
-      if (!isUuid(body.id)) return -1;
-      const { rowCount } = await db.query(
-        "DELETE FROM eligible_voters WHERE id = $1 AND election_id = $2",
-        [body.id, body.election_id]
-      );
-      return rowCount;
+      // A device whose entry is gone loses its check-in too, so it cannot
+      // stay verified with no entry behind it.
+      const devices = rows.map((r) => r.claimed_by_device).filter(Boolean);
+      if (devices.length) {
+        const { rows: gone } = await db.query(
+          "DELETE FROM checkins WHERE election_id = $1 AND device_hash = ANY($2) RETURNING device_hash",
+          [body.election_id, devices]
+        );
+        // One event per device, or one "recheck" event for a large batch.
+        if (gone.length > 25) {
+          await emit(db, body.election_id, "checkin_revoked", { all: true });
+        } else {
+          for (const g of gone) {
+            await emit(db, body.election_id, "checkin_revoked", { device_tag: g.device_hash });
+          }
+        }
+      }
+      return rows.length;
     });
     if (removed === -1) return NextResponse.json({ error: "id or all required" }, { status: 400 });
+    if (removed === -2) return NextResponse.json({ error: LIVE }, { status: 409 });
     return NextResponse.json({ ok: true, removed });
   } catch (err) {
     return NextResponse.json({ error: err.message }, { status: 500 });

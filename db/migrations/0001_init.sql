@@ -1,7 +1,7 @@
 -- ============================================================
 --  0001_init — Universal Election Platform: multi-tenant core
 --
---  Replaces the single-tenant NSBE schema (lib/schema.sql).
+--  Replaces the schema of the earlier single-tenant version.
 --  Tenancy: organization -> election -> position -> candidate.
 --  Isolation: Postgres RLS keyed on the per-request GUC
 --             app.current_org (set by lib/db.js withOrg()).
@@ -94,7 +94,7 @@ CREATE TABLE elections (
   UNIQUE (org_id, slug)
 );
 
--- ── Tenant data: positions (generalizes NSBE "roles") ──
+-- ── Tenant data: positions (the old single-tenant "roles") ──
 CREATE TABLE positions (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   election_id  uuid NOT NULL REFERENCES elections(id) ON DELETE CASCADE,

@@ -4,7 +4,7 @@
  * `next dev`. Admin actions authenticate via a real user session (Phase 2),
  * not the retired admin password.
  *
- *   npm run dev · npm run realtime · node scripts/smoke-backend.mjs
+ *   npm run dev · npm run dev:realtime · node scripts/smoke-backend.mjs
  */
 const BASE = process.env.BASE_URL || "http://localhost:3000";
 const EMAIL = process.env.DEMO_EMAIL || "demo@example.com";
@@ -60,7 +60,7 @@ async function main() {
   ok(dbl.status === 409, "double-launch rejected 409 (F2)");
 
   const checkin = await api("/api/checkin", { method: "POST",
-    body: { election_id: electionId, display_name: "Test Voter", device_hash: DEVICE, pin: "1975" } });
+    body: { election_id: electionId, display_name: "Test Voter", device_hash: DEVICE, pin: "197526" } });
   ok(checkin.status === 200 && checkin.json.ok, "voter check-in 200");
 
   const badPin = await api("/api/checkin", { method: "POST",

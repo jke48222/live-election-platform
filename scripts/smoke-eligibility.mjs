@@ -35,7 +35,7 @@ async function main() {
   const create = await api("/api/elections", {
     method: "POST",
     auth: true,
-    body: { org_slug: "demo", title: "Eligibility Test", slug: `elig-${rnd}`, eligibility_mode: "pin", pin: "1111" },
+    body: { org_slug: "demo", title: "Eligibility Test", slug: `elig-${rnd}`, eligibility_mode: "pin", pin: "111111" },
   });
   ok(create.status === 200, "create test election");
   const id = create.json.election.id;

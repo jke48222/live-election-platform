@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { query, withOrg } from "../../../lib/db";
 import { getSessionUser, getMembershipRole, authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
+import { isValidPin, PIN_RULE } from "../../../lib/eligibility";
+import { emit } from "../../../lib/realtime";
+import { checkinGuard } from "../../../lib/checkin-guard";
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,48}[a-z0-9])?$/;
 const ELIGIBILITY = ["open", "pin", "roster_csv", "email_magic_link", "access_code", "sso_oidc"];
@@ -21,11 +24,39 @@ async function adminOrg(user, { org_id, org_slug }) {
   return org;
 }
 
-/** GET /api/elections?org=<slug> — list elections for an org the caller admins. */
+/**
+ * GET /api/elections?org=<slug>          list elections for an org the caller admins.
+ * GET /api/elections?election_id=<uuid>  one election's admin settings, including
+ *                                        the room PIN (never in the public read).
+ */
 export async function GET(req) {
+  const params = new URL(req.url).searchParams;
+  const electionId = params.get("election_id");
+  if (electionId) {
+    if (!isUuid(electionId)) {
+      return NextResponse.json({ error: "Invalid election_id" }, { status: 400 });
+    }
+    const auth = await authorizeElection(req, electionId);
+    if (!auth) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    try {
+      const election = await withOrg(auth.orgId, async (db) => {
+        const { rows } = await db.query(
+          `SELECT id, slug, title, status, mode, eligibility_mode, pin
+             FROM elections WHERE id = $1`,
+          [electionId]
+        );
+        return rows[0] || null;
+      });
+      if (!election) return NextResponse.json({ error: "Election not found" }, { status: 404 });
+      return NextResponse.json({ election });
+    } catch (err) {
+      return NextResponse.json({ error: err.message }, { status: 500 });
+    }
+  }
+
   const user = await getSessionUser(req);
   if (!user) return NextResponse.json({ error: "Not signed in" }, { status: 401 });
-  const orgSlug = new URL(req.url).searchParams.get("org") || "";
+  const orgSlug = params.get("org") || "";
   const org = await adminOrg(user, { org_slug: orgSlug });
   if (!org) return NextResponse.json({ error: "Not authorized for this org" }, { status: 403 });
 
@@ -39,7 +70,7 @@ export async function GET(req) {
   return NextResponse.json({ org: { slug: org.slug }, elections });
 }
 
-/** POST /api/elections — create an election under an org the caller admins. */
+/** POST /api/elections: create an election under an org the caller admins. */
 export async function POST(req) {
   const user = await getSessionUser(req);
   if (!user) return NextResponse.json({ error: "Not signed in" }, { status: 401 });
@@ -69,6 +100,10 @@ export async function POST(req) {
   if (eligibility_mode === "pin" && !pin) {
     return NextResponse.json({ error: "A PIN is required for PIN eligibility." }, { status: 400 });
   }
+  // 6 to 8 digits (lib/eligibility.js). Voters can type 4 to 8.
+  if (pin && !isValidPin(pin)) {
+    return NextResponse.json({ error: PIN_RULE }, { status: 400 });
+  }
 
   try {
     const election = await withOrg(org.id, async (db) => {
@@ -78,7 +113,7 @@ export async function POST(req) {
         `INSERT INTO elections (org_id, slug, title, mode, status, eligibility_mode, pin)
          VALUES (nullif(current_setting('app.current_org',true),'')::uuid, $1, $2, $3, 'waiting', $4, $5)
          RETURNING id, slug, title, status, mode, eligibility_mode`,
-        [slug, title, mode, eligibility_mode, pin]
+        [slug, title, mode, eligibility_mode, pin || null]
       );
       return { election: rows[0] };
     });
@@ -89,7 +124,20 @@ export async function POST(req) {
   }
 }
 
-/** PATCH /api/elections { election_id, title?, eligibility_mode?, pin? } — settings (idle only). */
+/**
+ * PATCH /api/elections { election_id, title?, eligibility_mode?, pin? }: settings.
+ *
+ * Settings change only while no poll is live or locked, with one exception:
+ * a request that sets only `pin` on a PIN election is allowed at any time, so
+ * a host can rotate the PIN mid-meeting when the console shows someone
+ * guessing it. Voters already checked in stay checked in.
+ *
+ * The result must be usable: PIN mode needs a 6 to 8 digit PIN. Changing
+ * eligibility_mode removes every check-in and releases every roster, email
+ * and code claim, because a check-in verified under the old mode (a PIN, say)
+ * says nothing about the new one. Connected voters get checkin_revoked
+ * { all: true } and settings_changed, and check in again under the new mode.
+ */
 export async function PATCH(req) {
   let body;
   try {
@@ -106,12 +154,31 @@ export async function PATCH(req) {
   try {
     const result = await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        "SELECT status, active_position_id, eligibility_mode, pin FROM elections WHERE id = $1 FOR UPDATE",
         [body.election_id]
       );
-      if (!eRows[0]) return { error: "Election not found", status: 404 };
-      if (eRows[0].status === "voting" || eRows[0].active_position_id) {
+      const current = eRows[0];
+      if (!current) return { error: "Election not found", status: 404 };
+      const pinOnly =
+        typeof body.pin === "string" &&
+        body.title === undefined &&
+        body.eligibility_mode === undefined &&
+        current.eligibility_mode === "pin";
+      if ((current.status === "voting" || current.active_position_id) && !pinOnly) {
         return { error: "Finish the current poll before changing settings.", status: 409 };
+      }
+      const nextMode = ELIGIBILITY.includes(body.eligibility_mode)
+        ? body.eligibility_mode
+        : current.eligibility_mode;
+      const nextPin = typeof body.pin === "string" ? body.pin.trim() || null : current.pin;
+      if (typeof body.pin === "string" && nextPin && !isValidPin(nextPin)) {
+        return { error: PIN_RULE, status: 400 };
+      }
+      const modeChanged = nextMode !== current.eligibility_mode;
+      // A PIN election keeps working with a PIN set under the old 4-digit
+      // rule until the host changes it; a new or changed PIN must meet the rule.
+      if (nextMode === "pin" && (modeChanged || typeof body.pin === "string") && !isValidPin(nextPin || "")) {
+        return { error: "Set a 6 to 8 digit room PIN before switching to PIN mode.", status: 400 };
       }
       const fields = [];
       const params = [];
@@ -120,11 +187,11 @@ export async function PATCH(req) {
         fields.push(`title = $${params.length}`);
       }
       if (ELIGIBILITY.includes(body.eligibility_mode)) {
-        params.push(body.eligibility_mode);
+        params.push(nextMode);
         fields.push(`eligibility_mode = $${params.length}`);
       }
       if (typeof body.pin === "string") {
-        params.push(body.pin.trim() || null);
+        params.push(nextPin);
         fields.push(`pin = $${params.length}`);
       }
       if (fields.length === 0) return { error: "Nothing to update", status: 400 };
@@ -135,7 +202,21 @@ export async function PATCH(req) {
           RETURNING id, slug, title, status, mode, eligibility_mode, pin`,
         params
       );
-      return { election: rows[0] };
+      // A new PIN makes earlier guesses worthless, so the slowdown ends.
+      if (typeof body.pin === "string" && nextPin !== current.pin) checkinGuard.reset(body.election_id.toLowerCase());
+      if (!modeChanged) return { election: rows[0] };
+
+      const { rowCount: cleared } = await db.query(
+        "DELETE FROM checkins WHERE election_id = $1",
+        [body.election_id]
+      );
+      await db.query(
+        "UPDATE eligible_voters SET claimed_by_device = NULL WHERE election_id = $1",
+        [body.election_id]
+      );
+      await emit(db, body.election_id, "checkin_revoked", { all: true });
+      await emit(db, body.election_id, "settings_changed", { eligibility_mode: nextMode });
+      return { election: rows[0], checkins_cleared: cleared };
     });
     if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json(result);

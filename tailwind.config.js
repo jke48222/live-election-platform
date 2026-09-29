@@ -6,22 +6,24 @@ module.exports = {
   ],
   theme: {
     extend: {
+      // Admin console palette. Neutral names; the values keep the original look.
+      // `muted` is secondary text: 5.2:1 on `surface` and 5.8:1 on white (WCAG AA).
       colors: {
-        uga: {
-          red: "#BA0C2F",
-          "red-dark": "#8A0922",
-          black: "#000000",
-          white: "#FFFFFF",
-          gray: "#F3F4F6",
-          "gray-mid": "#9CA3AF",
+        brand: {
+          DEFAULT: "#BA0C2F",
+          dark: "#8A0922",
         },
+        ink: "#000000",
+        surface: "#F3F4F6",
+        muted: "#5F6673",
       },
+      // Fonts are self-hosted by next/font (app/layout.js), which sets these variables.
       fontFamily: {
-        display: ['"Merriweather"', "Georgia", "serif"],
-        body: ['"Source Sans 3"', '"Source Sans Pro"', "system-ui", "sans-serif"],
+        display: ["var(--font-display)", "Georgia", "serif"],
+        body: ["var(--font-body)", "system-ui", "sans-serif"],
       },
       keyframes: {
-        "pulse-red": {
+        "pulse-soft": {
           "0%, 100%": { opacity: "1" },
           "50%": { opacity: "0.6" },
         },
@@ -43,11 +45,13 @@ module.exports = {
         },
       },
       animation: {
-        "pulse-red": "pulse-red 2s ease-in-out infinite",
-        "slide-up": "slide-up 0.4s ease-out forwards",
-        "fade-in": "fade-in 0.3s ease-out forwards",
-        "scale-in": "scale-in 0.3s ease-out forwards",
-        "bar-grow": "bar-grow 0.6s ease-out forwards",
+        // `both` holds the first keyframe during an animation-delay, so a
+        // staggered item stays hidden until its turn instead of blinking.
+        "pulse-soft": "pulse-soft 2s ease-in-out infinite",
+        "slide-up": "slide-up 0.4s ease-out both",
+        "fade-in": "fade-in 0.3s ease-out both",
+        "scale-in": "scale-in 0.3s ease-out both",
+        "bar-grow": "bar-grow 0.6s ease-out both",
       },
     },
   },
