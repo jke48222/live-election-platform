@@ -14,6 +14,7 @@
  */
 import pg from "pg";
 import { hashPassword } from "../lib/auth.js";
+import { describeDbError } from "../lib/db.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL || "postgres://localhost:5432/elections";
@@ -116,6 +117,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(describeDbError(err, DATABASE_URL));
   process.exit(1);
 });
