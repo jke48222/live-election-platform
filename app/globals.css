@@ -1,14 +1,11 @@
-@import url("https://fonts.googleapis.com/css2?family=Merriweather:wght@700;900&family=Source+Sans+3:wght@400;500;600;700&display=swap");
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --uga-red: #BA0C2F;
-  --uga-black: #000000;
-  --uga-white: #FFFFFF;
-  --uga-gray: #F3F4F6;
+  --color-brand: #BA0C2F;
+  --color-ink: #000000;
+  --color-surface: #F3F4F6;
 }
 
 html {
@@ -16,9 +13,9 @@ html {
 }
 
 body {
-  font-family: "Source Sans 3", "Source Sans Pro", system-ui, sans-serif;
-  background-color: var(--uga-gray);
-  color: var(--uga-black);
+  font-family: var(--font-body), system-ui, sans-serif;
+  background-color: var(--color-surface);
+  color: var(--color-ink);
   min-height: 100dvh;
 }
 
@@ -29,13 +26,13 @@ body.voting-active {
 
 /* Accessible focus ring */
 :focus-visible {
-  outline: 3px solid var(--uga-red);
+  outline: 3px solid var(--color-brand);
   outline-offset: 2px;
 }
 
 /* Bar chart animation */
 .bar-fill {
-  animation: bar-grow 0.6s ease-out forwards;
+  animation: bar-grow 0.6s ease-out both;
 }
 
 @keyframes shimmer {
@@ -46,10 +43,23 @@ body.voting-active {
 .shimmer {
   background: linear-gradient(
     90deg,
-    var(--uga-gray) 25%,
+    var(--color-surface) 25%,
     #e5e7eb 50%,
-    var(--uga-gray) 75%
+    var(--color-surface) 75%
   );
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
+}
+
+/* Respect the OS "reduce motion" setting: no slides, scales, pulses or shimmer. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
