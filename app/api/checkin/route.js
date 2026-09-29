@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { clientIpFromReq, rateLimit } from "../../../lib/rate-limit";
+import { clientIpFromReq, deviceRateLimit, rateLimit } from "../../../lib/rate-limit";
 import { withOrg } from "../../../lib/db";
 import { emit } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
@@ -13,17 +13,15 @@ function nameKey(name) {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function tooMany(retryAfter, error = "Too many check-in attempts. Try again shortly.") {
+  return NextResponse.json(
+    { error },
+    { status: 429, headers: { "Retry-After": String(retryAfter) } }
+  );
+}
+
 /** POST — voter registers identity for an election (PIN-gated when applicable). */
 export async function POST(req) {
-  const ip = clientIpFromReq(req);
-  const limited = rateLimit(`checkin:${ip}`, 20, 60_000);
-  if (!limited.ok) {
-    return NextResponse.json(
-      { error: "Too many check-in attempts. Try again shortly." },
-      { status: 429, headers: { "Retry-After": String(limited.retryAfter) } }
-    );
-  }
-
   let body;
   try {
     body = await req.json();
@@ -42,6 +40,16 @@ export async function POST(req) {
   if (typeof deviceHash !== "string" || !/^[0-9a-f]{64}$/.test(deviceHash)) {
     return NextResponse.json({ error: "Invalid device identifier" }, { status: 400 });
   }
+
+  // A room on campus Wi-Fi shares one public IP, so the per-IP ceiling is
+  // high, and each device gets its own limit per election.
+  const ip = clientIpFromReq(req);
+  if (ip) {
+    const perIp = rateLimit(`checkin-ip:${ip}`, 300, 60_000);
+    if (!perIp.ok) return tooMany(perIp.retryAfter);
+  }
+  const perDevice = deviceRateLimit(`checkin:${electionId}:${deviceHash}`, 10, 60_000);
+  if (!perDevice.ok) return tooMany(perDevice.retryAfter);
 
   const orgId = await resolveElectionOrg(electionId);
   if (!orgId) return NextResponse.json({ error: "Unknown election" }, { status: 404 });

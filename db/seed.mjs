@@ -70,7 +70,7 @@ async function main() {
        VALUES ($1, $2, $3, true)
        ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash
        RETURNING id`,
-      [DEMO_USER.email, hashPassword(DEMO_USER.password), DEMO_USER.name]
+      [DEMO_USER.email, await hashPassword(DEMO_USER.password), DEMO_USER.name]
     );
     await c.query(
       `INSERT INTO memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')

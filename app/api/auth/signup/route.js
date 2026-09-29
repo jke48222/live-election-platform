@@ -8,12 +8,15 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /** POST /api/auth/signup { email, password, name } — create account + log in. */
 export async function POST(req) {
+  // Per-IP when a trusted proxy reports it, plus a ceiling for the whole
+  // process, since every signup costs a scrypt hash.
   const ip = clientIpFromReq(req);
-  const limited = rateLimit(`signup:${ip}`, 5, 60_000);
-  if (!limited.ok) {
+  const limited = ip ? rateLimit(`signup:${ip}`, 5, 60_000) : { ok: true };
+  const overall = limited.ok ? rateLimit("signup:all", 60, 60_000) : limited;
+  if (!overall.ok) {
     return NextResponse.json(
       { error: "Too many attempts. Try again shortly." },
-      { status: 429, headers: { "Retry-After": String(limited.retryAfter) } }
+      { status: 429, headers: { "Retry-After": String(overall.retryAfter) } }
     );
   }
 
@@ -33,6 +36,9 @@ export async function POST(req) {
   if (password.length < 8) {
     return NextResponse.json({ error: "Password must be at least 8 characters." }, { status: 400 });
   }
+  if (password.length > 1024 || email.length > 320) {
+    return NextResponse.json({ error: "Email or password is too long." }, { status: 400 });
+  }
 
   const existing = await query("SELECT 1 FROM users WHERE email = $1", [email]);
   if (existing.rows.length) {
@@ -43,7 +49,7 @@ export async function POST(req) {
   const { rows } = await query(
     `INSERT INTO users (email, password_hash, name, email_verification_token)
      VALUES ($1, $2, $3, $4) RETURNING id, email, name, email_verified`,
-    [email, hashPassword(password), name || null, verifyToken]
+    [email, await hashPassword(password), name || null, verifyToken]
   );
   const user = rows[0];
 
