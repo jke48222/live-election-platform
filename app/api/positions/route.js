@@ -3,6 +3,20 @@ import { withOrg } from "../../../lib/db";
 import { emit } from "../../../lib/realtime";
 import { authorizeElection } from "../../../lib/auth";
 import { isUuid } from "../../../lib/api-helpers";
+import { isIdle } from "../../../lib/state-guards";
+import { nameKey } from "../../_lib/poll";
+
+const DUPLICATE_TITLE = "This election already has a position with that title.";
+
+/** True when another position in the election already uses this title (any case). */
+async function titleTaken(db, electionId, title, exceptId = null) {
+  const { rows } = await db.query(
+    "SELECT id, title FROM positions WHERE election_id = $1",
+    [electionId]
+  );
+  const key = nameKey(title);
+  return rows.some((r) => r.id !== exceptId && nameKey(r.title) === key);
+}
 
 /**
  * Position (ballot office) management for the election builder. All operations
@@ -19,12 +33,12 @@ async function authorize(req, electionId) {
   return auth;
 }
 
-/** True when the election can be structurally edited. */
+/**
+ * True when the election can be structurally edited: no live or locked poll.
+ * 'completed' counts, so a race can be added after the last one closed.
+ */
 function editable(election) {
-  return (
-    (election.status === "draft" || election.status === "waiting") &&
-    !election.active_position_id
-  );
+  return isIdle(election);
 }
 
 /** GET /api/positions?election_id= — positions with their candidates (admin). */
@@ -52,6 +66,7 @@ export async function GET(req) {
     });
     return NextResponse.json({ positions });
   } catch (err) {
+    if (err.code === "23505") return NextResponse.json({ error: DUPLICATE_TITLE }, { status: 409 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
@@ -75,11 +90,15 @@ export async function POST(req) {
   try {
     const result = await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        "SELECT status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
         [body.election_id]
       );
       if (!eRows[0]) return { error: "Election not found", status: 404 };
       if (!editable(eRows[0])) return { error: "Finish the current poll before editing the ballot.", status: 409 };
+
+      if (await titleTaken(db, body.election_id, title)) {
+        return { error: DUPLICATE_TITLE, status: 409 };
+      }
 
       const { rows: ord } = await db.query(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM positions WHERE election_id = $1",
@@ -91,11 +110,25 @@ export async function POST(req) {
          RETURNING id, title, sort_order, max_winners, is_completed`,
         [body.election_id, title, ord[0].next, maxWinners]
       );
+      // A new race reopens a completed election so it can be launched.
+      if (eRows[0].status === "completed") {
+        await db.query(
+          "UPDATE elections SET status='waiting', updated_at=now() WHERE id=$1",
+          [body.election_id]
+        );
+        await emit(db, body.election_id, "state_change", {
+          status: "waiting",
+          active_position_id: null,
+          poll_expires_at: null,
+          server_now: new Date().toISOString(),
+        });
+      }
       return { position: { ...rows[0], candidates: [] } };
     });
     if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json(result);
   } catch (err) {
+    if (err.code === "23505") return NextResponse.json({ error: DUPLICATE_TITLE }, { status: 409 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
@@ -115,7 +148,7 @@ export async function PATCH(req) {
   try {
     const result = await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        "SELECT status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
         [body.election_id]
       );
       if (!eRows[0]) return { error: "Election not found", status: 404 };
@@ -145,7 +178,12 @@ export async function PATCH(req) {
       const fields = [];
       const params = [];
       if (typeof body.title === "string" && body.title.trim()) {
-        params.push(body.title.trim());
+        const title = body.title.trim();
+        if (title.length > 120) return { error: "Title too long.", status: 400 };
+        if (await titleTaken(db, body.election_id, title, body.id)) {
+          return { error: DUPLICATE_TITLE, status: 409 };
+        }
+        params.push(title);
         fields.push(`title = $${params.length}`);
       }
       if (body.max_winners != null) {
@@ -164,6 +202,7 @@ export async function PATCH(req) {
     if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json(result);
   } catch (err) {
+    if (err.code === "23505") return NextResponse.json({ error: DUPLICATE_TITLE }, { status: 409 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
@@ -183,7 +222,7 @@ export async function DELETE(req) {
   try {
     const result = await withOrg(auth.orgId, async (db) => {
       const { rows: eRows } = await db.query(
-        "SELECT status, active_position_id FROM elections WHERE id = $1",
+        "SELECT status, active_position_id FROM elections WHERE id = $1 FOR UPDATE",
         [body.election_id]
       );
       if (!eRows[0]) return { error: "Election not found", status: 404 };
@@ -198,6 +237,7 @@ export async function DELETE(req) {
     if (result.error) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json(result);
   } catch (err) {
+    if (err.code === "23505") return NextResponse.json({ error: DUPLICATE_TITLE }, { status: 409 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }

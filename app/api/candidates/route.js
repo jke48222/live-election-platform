@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { withOrg } from "../../../lib/db";
 import { authorizeElection } from "../../../lib/auth";
 import { resolveElectionOrg, isUuid } from "../../../lib/api-helpers";
+import { nameKey } from "../../_lib/poll";
+import { isIdle } from "../../../lib/state-guards";
+
+const DUPLICATE_NAME = "This position already has a candidate with that name.";
 
 /**
  * GET /api/candidates?election_id=&position_id=
@@ -49,8 +53,58 @@ async function withAdminElection(req, body, fn) {
   try {
     return await withOrg(auth.orgId, (db) => fn(db, electionId));
   } catch (err) {
+    if (err.code === "23505") return NextResponse.json({ error: DUPLICATE_NAME }, { status: 409 });
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
+}
+
+/**
+ * Candidates change only while the room is idle (no live or locked poll) and
+ * their race is not finalized. Otherwise a live ballot could change under
+ * voters, and deleting a candidate (and so their votes) could rewrite a
+ * result already announced. Locks the election row, like /api/state, so the
+ * check and the edit cannot be split by a launch. Returns { position } or
+ * { refusal } (a response to send).
+ */
+async function lockForBallotEdit(db, electionId, { positionId = null, candidateId = null }) {
+  const { rows: eRows } = await db.query(
+    "SELECT status, active_position_id FROM elections WHERE id=$1 FOR UPDATE",
+    [electionId]
+  );
+  if (!eRows[0]) {
+    return { refusal: NextResponse.json({ error: "Election not found" }, { status: 404 }) };
+  }
+  if (!isIdle(eRows[0])) {
+    return {
+      refusal: NextResponse.json(
+        { error: "Finish the current poll before changing candidates." },
+        { status: 409 }
+      ),
+    };
+  }
+  const { rows } = candidateId
+    ? await db.query(
+        `SELECT p.id, p.is_completed FROM candidates c JOIN positions p ON p.id = c.position_id
+          WHERE c.id = $1 AND p.election_id = $2`,
+        [candidateId, electionId]
+      )
+    : await db.query("SELECT id, is_completed FROM positions WHERE id=$1 AND election_id=$2", [
+        positionId,
+        electionId,
+      ]);
+  if (!rows[0]) {
+    const error = candidateId ? "Candidate not found" : "Unknown position";
+    return { refusal: NextResponse.json({ error }, { status: 404 }) };
+  }
+  if (rows[0].is_completed) {
+    return {
+      refusal: NextResponse.json(
+        { error: "This race is finalized. Reset it before changing its candidates." },
+        { status: 409 }
+      ),
+    };
+  }
+  return { position: rows[0] };
 }
 
 /** POST — add a floor nomination / write-in candidate. */
@@ -70,12 +124,21 @@ export async function POST(req) {
     if (name.length > 255) {
       return NextResponse.json({ error: "Name too long (max 255)" }, { status: 400 });
     }
-    // Position must belong to this election (defense in depth alongside RLS).
-    const { rows: pr } = await db.query(
-      "SELECT 1 FROM positions WHERE id=$1 AND election_id=$2",
-      [positionId, electionId]
+    // Position must belong to this election, the room must be idle and the
+    // race not finalized.
+    const { refusal } = await lockForBallotEdit(db, electionId, { positionId });
+    if (refusal) return refusal;
+
+    // A repeated submit (double Enter) or a second host adding the same
+    // nominee would split the vote between two identical ballot entries.
+    const { rows: existing } = await db.query(
+      "SELECT name FROM candidates WHERE position_id=$1",
+      [positionId]
     );
-    if (!pr[0]) return NextResponse.json({ error: "Unknown position" }, { status: 404 });
+    const key = nameKey(name);
+    if (existing.some((c) => nameKey(c.name) === key)) {
+      return NextResponse.json({ error: DUPLICATE_NAME }, { status: 409 });
+    }
 
     const { rows } = await db.query(
       `INSERT INTO candidates (position_id, org_id, name, is_active)
@@ -95,11 +158,13 @@ export async function PATCH(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  return withAdminElection(req, body, async (db) => {
+  return withAdminElection(req, body, async (db, electionId) => {
     const { id, is_active } = body;
     if (!isUuid(id) || typeof is_active !== "boolean") {
       return NextResponse.json({ error: "id and is_active required" }, { status: 400 });
     }
+    const { refusal } = await lockForBallotEdit(db, electionId, { candidateId: id });
+    if (refusal) return refusal;
     const { rows } = await db.query(
       "UPDATE candidates SET is_active=$1 WHERE id=$2 RETURNING id, name, is_active",
       [is_active, id]
@@ -117,9 +182,11 @@ export async function DELETE(req) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
-  return withAdminElection(req, body, async (db) => {
+  return withAdminElection(req, body, async (db, electionId) => {
     const { id } = body;
     if (!isUuid(id)) return NextResponse.json({ error: "id required" }, { status: 400 });
+    const { refusal } = await lockForBallotEdit(db, electionId, { candidateId: id });
+    if (refusal) return refusal;
     await db.query("DELETE FROM votes WHERE candidate_id=$1", [id]);
     const { rowCount } = await db.query("DELETE FROM candidates WHERE id=$1", [id]);
     if (!rowCount) return NextResponse.json({ error: "Candidate not found" }, { status: 404 });
