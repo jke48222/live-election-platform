@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 
 /**
- * Deprecated. The single-tenant NSBE seed (14 roles / 39 candidates) is gone —
- * elections are now created per-organization through the onboarding/builder
- * flow (Phase 4), never seeded. For local development fixtures use
+ * Deprecated. The single-tenant seed from the first version is gone.
+ * Elections are created per organization through the onboarding and builder
+ * flow, never seeded. This handler touches no data and answers 410 to every
+ * caller, signed in or not, in every environment. For local development fixtures use
  * `npm run db:seed` (db/seed.mjs), which loads a generic demo org.
  */
 export async function POST() {

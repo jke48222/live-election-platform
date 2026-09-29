@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * DEV-ONLY seed — generic demo data, NO hardcoded NSBE slate.
+ * Dev-only seed: generic demo data, with no real slate of candidates.
  *
  *   node --env-file=.env.local db/seed.mjs
  *
