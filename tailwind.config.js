@@ -6,15 +6,16 @@ module.exports = {
   ],
   theme: {
     extend: {
+      // Admin console palette. Neutral names; the values keep the original look.
+      // `muted` is secondary text: 5.2:1 on `surface` and 5.8:1 on white (WCAG AA).
       colors: {
-        uga: {
-          red: "#BA0C2F",
-          "red-dark": "#8A0922",
-          black: "#000000",
-          white: "#FFFFFF",
-          gray: "#F3F4F6",
-          "gray-mid": "#9CA3AF",
+        brand: {
+          DEFAULT: "#BA0C2F",
+          dark: "#8A0922",
         },
+        ink: "#000000",
+        surface: "#F3F4F6",
+        muted: "#5F6673",
       },
       // Fonts are self-hosted by next/font (app/layout.js), which sets these variables.
       fontFamily: {
