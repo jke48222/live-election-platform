@@ -1,11 +1,14 @@
 import Link from "next/link";
 
 /**
- * Landing page. A full marketing site comes in Phase 7; for now this is a
- * simple front door pointing hosts to the dashboard and explaining the
- * canonical voter URL shape (/<org>/<election>).
+ * Landing page: a simple front door that points hosts to the dashboard and
+ * shows the voter URL shape (/<org>/<election>).
  */
 export default function Home() {
+  // The seeded demo exists only in local development, or where DEMO_ELECTION
+  // ("<org>/<election>") names one on purpose.
+  const demo =
+    process.env.DEMO_ELECTION || (process.env.NODE_ENV !== "production" ? "demo/spring-2026" : "");
   return (
     <main className="min-h-dvh bg-slate-50 flex flex-col">
       <header className="px-6 py-4 flex items-center justify-between max-w-5xl mx-auto w-full">
@@ -22,9 +25,9 @@ export default function Home() {
         <h1 className="font-display font-black text-4xl sm:text-5xl text-slate-900 leading-tight">
           Run live, real-time elections for any organization.
         </h1>
-        <p className="mt-5 text-lg text-slate-500 leading-relaxed">
-          Presenter-paced voting with instant results, configurable eligibility, and your own
-          branding — fully self-hosted, no third-party services.
+        <p className="mt-5 text-lg text-slate-600 leading-relaxed">
+          Presenter-paced voting with instant results and a choice of how voters prove they can
+          vote. You host it yourself, and it calls no third-party services.
         </p>
         <div className="mt-8 flex flex-wrap gap-3 justify-center">
           <Link
@@ -33,24 +36,22 @@ export default function Home() {
           >
             Create an election
           </Link>
-          <Link
-            href="/demo/spring-2026"
-            className="h-12 px-6 inline-flex items-center rounded-xl border-2 border-slate-200 text-slate-900 font-bold hover:bg-white transition-colors"
-          >
-            View the demo ballot
-          </Link>
+          {demo && (
+            <Link
+              href={`/${demo.replace(/^\/+/, "")}`}
+              className="h-12 px-6 inline-flex items-center rounded-xl border-2 border-slate-200 text-slate-900 font-bold hover:bg-white transition-colors"
+            >
+              View the demo ballot
+            </Link>
+          )}
         </div>
-        <p className="mt-10 text-sm text-slate-400">
+        <p className="mt-10 text-sm text-slate-600">
           Voters join at{" "}
-          <code className="bg-slate-100 px-1.5 py-0.5 rounded text-slate-600">
+          <code className="bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
             /your-org/your-election
           </code>
         </p>
       </section>
-
-      <footer className="px-6 py-6 text-center text-xs text-slate-400">
-        Free in beta.
-      </footer>
     </main>
   );
 }

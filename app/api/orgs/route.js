@@ -4,7 +4,17 @@ import { getSessionUser } from "../../../lib/auth";
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])?$/;
 
-/** POST /api/orgs { name, slug, type } — create an org; caller becomes owner. */
+// An org's slug is the first segment of its voter links (/<org>/<election>),
+// so it must not shadow an app route or a name the site links to. "demo" is
+// the seeded demo org, which the landing page links to.
+const RESERVED_SLUGS = new Set([
+  "about", "account", "admin", "api", "app", "assets", "auth", "billing", "dashboard",
+  "demo", "docs", "help", "login", "logout", "new", "org", "orgs", "pricing", "privacy",
+  "public", "register", "settings", "signin", "signup", "static", "status", "support",
+  "terms", "vote", "www",
+]);
+
+/** POST /api/orgs { name, slug, type }: create an org; caller becomes owner. */
 export async function POST(req) {
   const user = await getSessionUser(req);
   if (!user) return NextResponse.json({ error: "Not signed in" }, { status: 401 });
@@ -25,6 +35,10 @@ export async function POST(req) {
       { error: "Slug must be 3–40 chars: lowercase letters, numbers, hyphens." },
       { status: 400 }
     );
+  }
+
+  if (RESERVED_SLUGS.has(slug)) {
+    return NextResponse.json({ error: "That slug is reserved. Pick another." }, { status: 409 });
   }
 
   const dupe = await query("SELECT 1 FROM organizations WHERE slug = $1", [slug]);
