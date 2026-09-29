@@ -15,7 +15,7 @@ import { ballotRef, isDeviceId, voterKey } from "../../../lib/voter-identity";
  *   - roster_csv / email / sso : check-in must exist AND be verified
  *
  * `device_hash` is the voter's secret device id. The ballot is recorded by
- * cast_ballot() (db/migrations/0005) under ballotRef(): the claimed roster,
+ * cast_ballot() (db/migrations/0007) under ballotRef(): the claimed roster,
  * email or access-code entry in those modes, otherwise the device's key. So
  * one listed person gets one ballot per race however many devices they use.
  *
