@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  PUBLISHED_REALTIME_SECRETS,
   emit,
   issueTicket,
   realtimeSecret,
@@ -66,6 +67,19 @@ test("realtimeSecret requires a real secret in production only", () => {
   assert.throws(() => realtimeSecret({ REALTIME_SECRET: "short" }), /32/);
   assert.equal(realtimeSecret({ NODE_ENV: "production", REALTIME_SECRET: SECRET }), SECRET);
   assert.ok(realtimeSecret({}).length >= 32);
+});
+
+test("realtimeSecret refuses a published key outside development", () => {
+  assert.equal(PUBLISHED_REALTIME_SECRETS[0], "local-only-realtime-secret-replace-before-deploying");
+  for (const published of PUBLISHED_REALTIME_SECRETS) {
+    for (const nodeEnv of [undefined, "", "production", "test", "staging"]) {
+      assert.throws(
+        () => realtimeSecret({ NODE_ENV: nodeEnv, REALTIME_SECRET: published }),
+        /published in this repository[\s\S]*openssl rand -hex 32/
+      );
+    }
+    assert.equal(realtimeSecret({ NODE_ENV: "development", REALTIME_SECRET: published }), published);
+  }
 });
 
 test("tickets verify, bind to one election and scope, and expire", () => {

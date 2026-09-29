@@ -4,7 +4,7 @@
  * `next dev`. Admin actions authenticate via a real user session (Phase 2),
  * not the retired admin password.
  *
- *   npm run dev · npm run realtime · node scripts/smoke-backend.mjs
+ *   npm run dev · npm run dev:realtime · node scripts/smoke-backend.mjs
  */
 const BASE = process.env.BASE_URL || "http://localhost:3000";
 const EMAIL = process.env.DEMO_EMAIL || "demo@example.com";

@@ -2,12 +2,15 @@
 # server and the realtime gateway run on the host with npm scripts.
 #
 #   docker compose up -d
-#   npm run db:migrate && npm run db:seed && npm run db:verify
+#   npm run dev:db:migrate && npm run db:seed && npm run db:verify
 #
 # with these in .env.local:
 #   DATABASE_URL=postgres://postgres:postgres@localhost:5432/elections
 #   APP_DATABASE_URL=postgres://app:app_local_dev@localhost:5432/elections
 #   APP_DB_PASSWORD=app_local_dev
+#
+# Outside NODE_ENV=development, `npm run db:migrate`, `npm run realtime` and
+# `npm start` refuse the app_local_dev password.
 #
 # The port is bound to 127.0.0.1 so the database, and its public dev
 # passwords, are never reachable from other machines.

@@ -19,8 +19,9 @@
  *
  * Env (read by config.mjs). Only NODE_ENV=development counts as development,
  * the same rule as lib/db.js. NODE_ENV unset, "test" or anything else is
- * production, where the first three settings below are required and a signed
- * ticket is always needed to subscribe.
+ * production, where the first three settings below are required, the local
+ * example values are refused, and a signed ticket is always needed to
+ * subscribe.
  *   APP_DATABASE_URL          least-privilege `app` role. The gateway never falls
  *                             back to DATABASE_URL (the owner role), which
  *                             bypasses row-level security.

@@ -8,7 +8,10 @@
  * production. In production the gateway needs APP_DATABASE_URL,
  * REALTIME_SECRET and REALTIME_ALLOWED_ORIGINS, and it always requires a
  * signed ticket to subscribe. Missing settings throw instead of falling back
- * to development values, so a misconfigured deploy fails at startup.
+ * to development values, so a misconfigured deploy fails at startup. So do
+ * the values published in this repository: the development password for the
+ * `app` role in APP_DATABASE_URL (lib/db.js) and the example REALTIME_SECRET
+ * (lib/realtime.js).
  */
 import { resolveAppDatabaseUrl } from "../../lib/db.js";
 import { realtimeSecret } from "../../lib/realtime.js";
@@ -48,7 +51,7 @@ export function resolveGatewayConfig(env = process.env) {
   try {
     secret = realtimeSecret(env);
   } catch (err) {
-    throw new GatewayConfigError(err.message);
+    throw new GatewayConfigError(`${err.message} Refusing to start the gateway in ${mode}.`);
   }
 
   const allowedOrigins = parseOrigins(env.REALTIME_ALLOWED_ORIGINS);

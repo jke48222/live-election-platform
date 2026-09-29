@@ -161,7 +161,7 @@ migration, and [`db/migrations/0001_init.sql:199`](db/migrations/0001_init.sql) 
 the schema plus exactly `SELECT, INSERT, UPDATE, DELETE` on tables, and nothing more. It never owns
 anything, because the migration runs as the owner. Migrations and the dev seed connect as the owner
 via `DATABASE_URL`. The running application connects as `app` via `APP_DATABASE_URL`
-([`lib/db.js:27`](lib/db.js)). Two connection strings, two privilege levels, and the one the web
+([`lib/db.js:52`](lib/db.js)). Two connection strings, two privilege levels, and the one the web
 server uses cannot bypass a policy.
 
 ### 2. A deploy that gets this wrong refuses to start
@@ -174,6 +174,13 @@ Two connection strings are easy to mix up, so the app does not trust the configu
   [`next.config.js`](next.config.js)). The gateway does the same, and it treats every `NODE_ENV`
   other than `development` as production. CI starts each server without these settings and fails
   if one comes up.
+- The local example values are refused wherever they could reach a real deploy. `next start` always
+  exits, and the gateway exits outside `NODE_ENV=development`, when `APP_DATABASE_URL` uses the
+  `app_local_dev` password from [`.env.example`](.env.example) or when `REALTIME_SECRET` is the
+  value `.env.example` used to ship or the built-in development key. `db:migrate` exits outside
+  development when `APP_DB_PASSWORD` is `app_local_dev`. `.env.example` leaves `REALTIME_SECRET`
+  empty. CI checks the example secret and the development password against both servers and
+  `db:migrate`, and unit tests cover the other forms.
 - Before its first query, [`lib/db.js`](lib/db.js) asks Postgres what the connected role can do,
   and refuses a role that is a superuser, has `BYPASSRLS`, or owns (or inherits ownership of) any
   table under RLS. The gateway runs the same check at startup. Pointing `APP_DATABASE_URL` at the
@@ -210,7 +217,7 @@ returns nothing, which is a visible bug in your own feature, not a silent cross-
 cannot insert a row tagged organization B, even by putting B's id directly in the INSERT.
 
 The scope itself is set per transaction, not per connection:
-[`lib/db.js:201`](lib/db.js) calls `set_config('app.current_org', $1, true)` where the third
+[`lib/db.js:236`](lib/db.js) calls `set_config('app.current_org', $1, true)` where the third
 argument `true` means transaction-local. That matters because connections are pooled. A
 connection-level setting would leak one request's tenant scope into the next request that borrows
 the same connection. Transaction-local scoping ends at COMMIT or ROLLBACK.
@@ -346,8 +353,8 @@ What has and has not been measured.
 | Election builder, 8 checks | Org, election, positions, candidates created over HTTP | [`scripts/smoke-builder.mjs`](scripts/smoke-builder.mjs) |
 | Realtime end to end, 15 checks | Voter ticket from check-in, admin ticket from `/api/realtime/ticket`, forged and missing tickets refused, then a real `/api/state` launch through `pg_notify` and the gateway to both sockets | [`scripts/smoke-realtime-e2e.mjs`](scripts/smoke-realtime-e2e.mjs) |
 | Guards, 32 checks | 120 wrong room PINs never block the right one, one guessing device is refused, stale tabs cannot finalize a runoff, two-seat results, the voter list is fixed during a poll, strangers cannot lock the owner out | [`scripts/smoke-guards.mjs`](scripts/smoke-guards.mjs) |
-| Unit tests, 194 | `node:test`, no database: rate limits, check-in and login guards, eligibility claims, state guards, seat counting, auth, startup settings, the gateway, the realtime client, poll timing and UI state | `npm test` |
-| Source size | 11,094 lines of JS and MJS plus 2,104 of tests, 740 lines of SQL | repo |
+| Unit tests, 248 | `node:test`, no database: rate limits, check-in and login guards, eligibility claims, state guards, seat counting, auth, startup settings, the gateway, the realtime client, poll timing and UI state | `npm test` |
+| Source size | 11,207 lines of JS and MJS plus 2,355 of tests, 740 lines of SQL | repo |
 
 **Methodology.** The unit tests use Node's built-in `node:test` and need nothing running. The
 verification scripts are hand-rolled Node files that print check marks and exit non-zero on failure,
@@ -356,7 +363,8 @@ and most of them need a running server, the realtime gateway, and a seeded Postg
 a production build, migrations twice (the second must be a no-op), the seed, and `db:verify`. It
 then starts `next start` and the gateway in production mode, with tickets required, and runs
 `realtime:verify` and every smoke script. Last, it checks that each server refuses to start
-without its required settings. There are still no browser
+without its required settings or with the example secret and development password, and that `db:migrate`
+refuses the development password. There are still no browser
 or component tests; the UI was checked by hand.
 
 **Not measured, and therefore not claimed:** latency. An earlier version of this README claimed
@@ -391,11 +399,16 @@ bound to 127.0.0.1 only. It is not a deployment. The full self-host stack (app, 
 terminator, object storage) is phase 8 and does not exist yet.
 
 **2. Configure the environment.** Copy [`.env.example`](.env.example) to `.env.local`. Its values
-match the Docker database.
+match the Docker database and are for local development only.
 
 ```bash
 cp .env.example .env.local
 ```
+
+`REALTIME_SECRET` is empty in the example. That is fine for local development: `npm run dev` and
+`npm run dev:realtime` then share a built-in development key. The servers (`npm start`,
+`npm run realtime`) and `db:migrate` refuse the `app_local_dev` database password unless `NODE_ENV`
+is `development`, which the `dev` scripts set.
 
 The two connection strings are the isolation model described above and are not interchangeable.
 `DATABASE_URL` is the owner, used only by migrations, the seed, and `db:verify`. `APP_DATABASE_URL`
@@ -405,28 +418,43 @@ is the least-privilege `app` role, used by the web server and the gateway so tha
 
 ```bash
 npm install
-npm run db:migrate    # creates the `app` role, applies db/migrations/*.sql in order
-npm run db:seed       # plans, a demo org, a demo owner, a two-position sample election
-npm run db:verify     # proves RLS isolation. Expect: ALL RLS CHECKS PASSED
+npm run dev:db:migrate  # creates the `app` role, applies db/migrations/*.sql in order
+npm run db:seed         # plans, a demo org, a demo owner, a two-position sample election
+npm run db:verify       # proves RLS isolation. Expect: ALL RLS CHECKS PASSED
 ```
 
-`db:migrate` is idempotent: it records applied files in `schema_migrations` and prints
-"Already up to date." on a second run. `db:seed` skips the demo organization if its slug already
-exists.
+`dev:db:migrate` is `db:migrate` with `NODE_ENV=development`, so it accepts the example
+`app_local_dev` password. Both are idempotent: they record applied files in `schema_migrations` and
+print "Already up to date." on a second run. `db:seed` skips the demo organization if its slug
+already exists.
 
 **4. Run the app and the gateway.** Two terminals, both required. Without the gateway the pages
 still load and poll, but updates arrive late.
 
 ```bash
-npm run dev        # terminal 1, Next.js on :3000
-npm run realtime   # terminal 2, WebSocket gateway on :3001
+npm run dev            # terminal 1, Next.js on :3000
+npm run dev:realtime   # terminal 2, WebSocket gateway on :3001
 ```
 
-`npm run realtime` runs the gateway as it would in production. It requires a signed ticket to
-subscribe and accepts sockets only from `REALTIME_ALLOWED_ORIGINS`, which `.env.example` sets to
-`http://localhost:3000`. Open the app at that address, not `127.0.0.1:3000`, or the live updates
-will not connect. `npm run dev:realtime` runs it with `NODE_ENV=development` instead, where tickets
-are optional and the settings have development defaults.
+Both run with `NODE_ENV=development`. In that mode the gateway accepts a subscribe without a ticket
+and logs a warning saying so. It still accepts sockets only from `REALTIME_ALLOWED_ORIGINS`, which
+`.env.example` sets to `http://localhost:3000`, so open the app at that address, not
+`127.0.0.1:3000`, or the live updates will not connect. To exercise tickets locally, start the
+gateway with them required:
+
+```bash
+REALTIME_REQUIRE_TICKET=1 npm run dev:realtime
+```
+
+The pages get their tickets from the dev server, which signs them with the same key the gateway
+checks: the built-in development key while `REALTIME_SECRET` is empty, or your own value once you
+set one.
+
+`npm run realtime` and `npm start` are the production commands. They refuse the local example
+values: an empty `REALTIME_SECRET` and the `app_local_dev` password. `npm run realtime` also
+requires a signed ticket for every subscribe. To run them on your machine, generate a secret with
+`openssl rand -hex 32`, set a new `APP_DB_PASSWORD` and the same password in `APP_DATABASE_URL`,
+and run `npm run db:migrate` to give the `app` role that password.
 
 - Voter ballot: `http://localhost:3000/demo/spring-2026`, room PIN `197526`
 - Host dashboard: `http://localhost:3000/admin`, sign in as `demo@example.com` / `demodemo123`
@@ -442,7 +470,7 @@ tab flips to a ballot with a live countdown, with no refresh.
 **5. Tests.**
 
 ```bash
-npm test                   # 194 unit tests, nothing needs to be running
+npm test                   # 248 unit tests, nothing needs to be running
 ```
 
 The verification scripts need step 4 running first.
@@ -463,9 +491,9 @@ npm run build     # production build
 npm start         # serve the production build
 ```
 
-`npm start` refuses to start unless `.env.local` has `APP_DATABASE_URL` and a `REALTIME_SECRET` of
-32 or more characters. The `REALTIME_SECRET` in `.env.example` is for your own machine. Generate a
-new one for any real deploy with `openssl rand -hex 32`, and give the gateway the same value.
+`npm start` refuses to start unless `.env.local` has an `APP_DATABASE_URL` without the
+`app_local_dev` password and a `REALTIME_SECRET` of 32 or more characters other than the old example
+value and the built-in development key. Generate the secret with `openssl rand -hex 32`, and give the gateway the same value.
 
 There is no lint script. Next.js 16 removed `next lint`, and `next build` no longer lints.
 
@@ -474,10 +502,10 @@ refuse to start without these:
 
 | Variable | Used by | Why |
 | --- | --- | --- |
-| `APP_DATABASE_URL` | app, gateway | The `app` role. A superuser, `BYPASSRLS`, or owner role is refused. |
-| `REALTIME_SECRET` | app, gateway | 32 or more characters, the same in both. Signs subscribe tickets and check-in tags. |
+| `APP_DATABASE_URL` | app, gateway | The `app` role. A superuser, `BYPASSRLS`, or owner role is refused, and so is the `app_local_dev` password. |
+| `REALTIME_SECRET` | app, gateway | 32 or more characters, the same in both. Signs subscribe tickets and check-in tags. The old example value and the built-in development key are refused. |
 | `REALTIME_ALLOWED_ORIGINS` | gateway | The site's origin, for example `https://vote.example.org`. Tickets are always required in production. |
-| `APP_DB_PASSWORD` | `db:migrate` | Only needed when running migrations. |
+| `APP_DB_PASSWORD` | `db:migrate` | Only needed when running migrations. `app_local_dev` is refused. |
 
 Set `TRUSTED_PROXY_HOPS` to the number of proxies in front of the app that append to
 `X-Forwarded-For`. Without it the app ignores that header (a client can set it) and per-IP rate

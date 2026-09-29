@@ -18,8 +18,8 @@
  * 1 means it must refuse it (any gateway outside NODE_ENV=development), 0
  * means it must accept it, and unset only reports which it did.
  *
- *   npm run dev          # terminal 1
- *   npm run realtime     # terminal 2
+ *   npm run dev            # terminal 1
+ *   npm run dev:realtime   # terminal 2
  *   node scripts/smoke-realtime-e2e.mjs
  */
 import crypto from "node:crypto";

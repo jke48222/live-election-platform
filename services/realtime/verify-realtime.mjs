@@ -13,7 +13,8 @@
  *   5. When Postgres kills the gateway's LISTEN connection, subscribed clients
  *      are told live:false, then live:true and 'resync' once it reconnects.
  *
- * Assumes the gateway is already running (npm run realtime). Then:
+ * Assumes the gateway is already running (npm run dev:realtime locally, or
+ * npm run realtime with production settings). Then:
  *   node --env-file=.env.local services/realtime/verify-realtime.mjs
  *
  * Every client here subscribes with a signed ticket, so the checks pass

@@ -10,8 +10,12 @@
  *   - APP_DB_PASSWORD unset anywhere else: refuse. A hard-coded password is
  *     published in this repo, so it must never reach a real database, and an
  *     existing role's password is never changed without being asked.
+ *   - APP_DB_PASSWORD equal to that published password outside
+ *     NODE_ENV=development: refuse, for the same reason.
  */
-export const DEV_APP_DB_PASSWORD = "app_local_dev";
+import { DEV_APP_DB_PASSWORD } from "../lib/db.js";
+
+export { DEV_APP_DB_PASSWORD };
 
 /**
  * @param {{ roleExists: boolean, env?: Record<string, string | undefined> }} input
@@ -23,6 +27,16 @@ export function planAppRole({ roleExists, env = process.env }) {
   const isDev = env.NODE_ENV === "development";
 
   if (password !== undefined && password !== "") {
+    if (!isDev && password === DEV_APP_DB_PASSWORD) {
+      return {
+        action: "error",
+        message:
+          `APP_DB_PASSWORD is the local development password (${DEV_APP_DB_PASSWORD}), which is ` +
+          "published in this repository and must not be used outside NODE_ENV=development. " +
+          "Set APP_DB_PASSWORD to a password of your own, for example the output of " +
+          "`openssl rand -hex 24`, and use the same one in APP_DATABASE_URL.",
+      };
+    }
     return roleExists ? { action: "alter", password } : { action: "create", password };
   }
 

@@ -118,9 +118,11 @@ jobs:
       - name: Smoke test, check-in, login and results guards
         run: node scripts/smoke-guards.mjs
 
-      # A production server missing a required setting must exit, not come up
-      # half-working. `timeout` exits 124 if a server keeps running.
-      - name: Production servers refuse to start without their settings
+      # A production server missing a required setting, or given a value
+      # published in this repo, must exit, not come up half-working. So must
+      # db:migrate given the dev app password. `timeout` exits 124 if a server
+      # keeps running.
+      - name: Production servers refuse missing or published settings
         run: |
           refuses() {
             local label=$1; shift
@@ -137,9 +139,14 @@ jobs:
           refuses "next start without APP_DATABASE_URL" env -u APP_DATABASE_URL npx next start -p 3002 -H 127.0.0.1
           refuses "next start without REALTIME_SECRET" env -u REALTIME_SECRET npx next start -p 3002 -H 127.0.0.1
           refuses "next start with a short REALTIME_SECRET" env REALTIME_SECRET=too-short npx next start -p 3002 -H 127.0.0.1
+          refuses "next start with the example REALTIME_SECRET" env REALTIME_SECRET=local-only-realtime-secret-replace-before-deploying npx next start -p 3002 -H 127.0.0.1
+          refuses "next start with the dev app password" env APP_DATABASE_URL=postgres://app:app_local_dev@127.0.0.1:5432/elections npx next start -p 3002 -H 127.0.0.1
           refuses "gateway without APP_DATABASE_URL" env -u APP_DATABASE_URL NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
           refuses "gateway without REALTIME_SECRET" env -u REALTIME_SECRET NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway with the example REALTIME_SECRET" env REALTIME_SECRET=local-only-realtime-secret-replace-before-deploying NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
+          refuses "gateway with the dev app password" env APP_DATABASE_URL=postgres://app:app_local_dev@127.0.0.1:5432/elections NODE_ENV=production REALTIME_PORT=3003 REALTIME_ALLOWED_ORIGINS=http://127.0.0.1:3000 node services/realtime/server.mjs
           refuses "gateway without REALTIME_ALLOWED_ORIGINS" env NODE_ENV=production REALTIME_PORT=3003 node services/realtime/server.mjs
+          refuses "db:migrate with the dev app password" env APP_DB_PASSWORD=app_local_dev node db/migrate.mjs
 
       - name: Server logs
         if: failure()

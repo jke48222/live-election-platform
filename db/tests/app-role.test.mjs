@@ -42,6 +42,30 @@ test("no plan ever falls back to the dev password outside development", () => {
   }
 });
 
+for (const nodeEnv of [undefined, "", "production", "test", "staging"]) {
+  for (const roleExists of [true, false]) {
+    test(`refuses the published dev password as APP_DB_PASSWORD (NODE_ENV=${nodeEnv ?? "unset"}, role exists=${roleExists})`, () => {
+      const plan = planAppRole({ roleExists, env: { NODE_ENV: nodeEnv, APP_DB_PASSWORD: DEV_APP_DB_PASSWORD } });
+      assert.equal(plan.action, "error");
+      assert.equal(plan.password, undefined);
+      assert.match(plan.message, /published/);
+      assert.match(plan.message, /openssl rand/);
+    });
+  }
+}
+
+test("development accepts the dev password as APP_DB_PASSWORD", () => {
+  const env = { NODE_ENV: "development", APP_DB_PASSWORD: DEV_APP_DB_PASSWORD };
+  assert.deepEqual(planAppRole({ roleExists: false, env }), { action: "create", password: DEV_APP_DB_PASSWORD });
+  assert.deepEqual(planAppRole({ roleExists: true, env }), { action: "alter", password: DEV_APP_DB_PASSWORD });
+});
+
+test("the migration runner and the app share one dev password", async () => {
+  const db = await import("../../lib/db.js");
+  assert.equal(DEV_APP_DB_PASSWORD, db.DEV_APP_DB_PASSWORD);
+  assert.equal(db.connectionPassword(db.DEV_APP_DATABASE_URL), DEV_APP_DB_PASSWORD);
+});
+
 test("pgLiteral escapes single quotes", () => {
   assert.equal(pgLiteral("it's"), "'it''s'");
   assert.equal(pgLiteral("a'; DROP ROLE app; --"), "'a''; DROP ROLE app; --'");
